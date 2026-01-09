@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codes"
+version = "0.1.0"
+description = "Utility classes and methods that I use across projects in my PhD, on using high-res geodetic data and probabilistic inversions to probe the damage zone around faults."
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    # Add runtime dependencies here
+    "numpy>=2.0.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

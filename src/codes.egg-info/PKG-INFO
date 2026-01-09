@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: codes
+Version: 0.1.0
+Summary: Utility classes and methods that I use across projects in my PhD, on using high-res geodetic data and probabilistic inversions to probe the damage zone around faults.
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=2.0.2
+
+This package contains codes that I use across various projects in my PhD, which is using high-resolution data (geodetic, seismic, etc) and probabilistic inversions to study the damage zone around faults.
+
+Bundling these codes into a package is also an excuse for me to keep my code clean, modular, and well-documented!
