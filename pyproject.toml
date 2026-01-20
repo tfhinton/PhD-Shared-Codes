@@ -12,6 +12,8 @@ requires-python = ">=3.9"
 dependencies = [
     # Add runtime dependencies here
     "numpy>=2.0.2",
+    "pyproj>=3.6.1",
+    "rioxarray>=0.15.0",
 ]
 
 [tool.setuptools]

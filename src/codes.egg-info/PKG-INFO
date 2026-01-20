@@ -5,6 +5,8 @@ Summary: Utility classes and methods that I use across projects in my PhD, on us
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 Requires-Dist: numpy>=2.0.2
+Requires-Dist: pyproj>=3.6.1
+Requires-Dist: rioxarray>=0.15.0
 
 This package contains codes that I use across various projects in my PhD, which is using high-resolution data (geodetic, seismic, etc) and probabilistic inversions to study the damage zone around faults.
 
