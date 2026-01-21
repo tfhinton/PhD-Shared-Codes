@@ -1,4 +1,5 @@
-from .ObsData import ObsData
 from .OpticalData import OpticalData
+from .Fault import Fault
+from .ProfileData import ProfileData
 
-__all__ = ["ObsData", "OpticalData"]
+__all__ = ["OpticalData", "Fault", "ProfileData"]

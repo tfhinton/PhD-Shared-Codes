@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
-src/codes/ObsData.py
+src/codes/DisplacementProfile.py
+src/codes/Fault.py
 src/codes/OpticalData.py
 src/codes/__init__.py
 src/codes.egg-info/PKG-INFO

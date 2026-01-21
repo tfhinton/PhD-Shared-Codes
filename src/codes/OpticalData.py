@@ -2,6 +2,8 @@
 import rioxarray as rxr
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import numpy as np
+import copy
 
 ###   OpticalData class
 class OpticalData:
@@ -11,9 +13,7 @@ class OpticalData:
 
     Properties:
         ew (xarray DataArray): East-West optical image correlation data in form of xarray DataArray
-        ew_source (xarray DataArray): original copy of EW optical DataArray (i.e. before downsampling, etc)
         ns (xarray DataArray): North-South optical image correlation data in form of xarray DataArray
-        ns_source (xarray DataArray): original copy of NS optical DataArray (i.e. before downsampling, etc)
         verbose (bool): Whether to print status messages
     '''
 
@@ -31,19 +31,22 @@ class OpticalData:
         # Init object attributes
         self.verbose = verbose
         self.ew = None
-        self.ew_source = None
         self.ns = None
-        self.ns_source = None
-        self.strain = None
+        # self.strain = None
 
         # Import TIF files if filepaths provided
         if "ew_filepath" in import_tif_kwargs or "ns_filepath" in import_tif_kwargs:
-            self.import_tif(**import_tif_kwargs)
+            self = self.import_tif(**import_tif_kwargs)
 
 
     ## Helper method to print if verbose is enabled
     def _print(self, *args):
         if self.verbose: print(*args)
+
+
+    ## Helper method to return a copy of the class instance
+    def _copy(self):
+        return copy.copy(self)
 
 
     ## Method to import EW and NS TIF files
@@ -57,22 +60,19 @@ class OpticalData:
             ew_filepath (str): Filepath to East-West TIF file.
             ns_filepath (str): Filepath to North-South TIF file.
         '''
-
         self._print("Importing TIF files:", ew_filepath, ns_filepath)
 
         # Import and store raster data as xarray DataArrays
         if ew_filepath is not None:
-            self.ew_source = rxr.open_rasterio(ew_filepath).squeeze("band", drop=True)
-            self.ew = self.ew_source
+            self.ew = rxr.open_rasterio(ew_filepath).squeeze("band", drop=True)
             self._print("Imported EW data shape:", self.ew.shape)
         
         if ns_filepath is not None:
-            self.ns_source = rxr.open_rasterio(ns_filepath).squeeze("band", drop=True)
-            self.ns = self.ns_source
+            self.ns = rxr.open_rasterio(ns_filepath).squeeze("band", drop=True)
             self._print("Imported NS data shape:", self.ns.shape)
 
         self._print("")
-        return
+        return self
     
 
     ## Method to clean out NaN values
@@ -84,18 +84,18 @@ class OpticalData:
         Kwargs:
             clear_zero (bool): Remove zero (0.) values from data.
         '''
-
-        self._print("Clearing NaNs...")
+        _self = self._copy()
+        _self._print("Clearing NaNs...")
 
         if ew:
-            self.ew = self.ew.where(self.ew.notnull())
-            if clear_zero: self.ew = self.ew.where(self.ew != 0.)
+            _self.ew = _self.ew.where(_self.ew.notnull())
+            if clear_zero: _self.ew = _self.ew.where(_self.ew != 0.)
         if ns:
-            self.ns = self.ns.where(self.ns.notnull())
-            if clear_zero: self.ns = self.ns.where(self.ns != 0.)
+            _self.ns = _self.ns.where(_self.ns.notnull())
+            if clear_zero: _self.ns = _self.ns.where(_self.ns != 0.)
         
-        self._print("... cleared.")
-        return
+        _self._print("... cleared.")
+        return _self
 
 
     ## Method to quickly downsample (i.e. reduce resolution) of optical data
@@ -103,7 +103,6 @@ class OpticalData:
 
         '''
         Downsample optical data simply by sampling every nth data point (i.e. n=10 is decimation).
-        Saves downsampled data to self.ew but leaves self.ew_source untouched.
         
         Kwargs:
             decimate_factor (int): Positive integer n, resampling will select every nth point,
@@ -111,61 +110,73 @@ class OpticalData:
             ew (bool): Decimate and return EW data if true
             ns (bool): Decimate and return NS data if true
         '''
+        _self = self._copy()
 
         # Copy EW DataArray from source and decimate
         if ew:
-            self._print("Decimating EW optical...")
-            self.ew = self.ew_source.copy()
-            self.ew = self.ew.isel(x=slice(0,None,decimate_factor), y=slice(0,None,decimate_factor))
+            _self._print("Decimating EW optical...")
+            _self.ew = _self.ew.isel(x=slice(0,None,decimate_factor), y=slice(0,None,decimate_factor))
         
         # Copy NS DataArray from source and decimate
         if ns:
-            self._print("Decimating NS optical...")
-            self.ns = self.ns_source.copy()
-            self.ns = self.ns.isel(x=slice(0,None,decimate_factor), y=slice(0,None,decimate_factor))
+            _self._print("Decimating NS optical...")
+            _self.ns = _self.ns.isel(x=slice(0,None,decimate_factor), y=slice(0,None,decimate_factor))
         
-        self._print("Decimated")
-        self._print("")
+        _self._print("Decimated")
+        _self._print("")
+        return _self
     
 
-    ## Method to reproject into new CRS
-    def reproject(self, target_crs, ew=True, ns=True, save=True):
+    ## Method to evaluate displacement along a given profile
+    def evaluate_profile(self, profile, n_eval_pts=200):
 
         '''
-        Reproject data into new coordinate system
+        Evaluate displacement along a profile given a profile geometry. Rotates EW and NS into profile-parallel
+        and profile-perpendicular components.
 
-        Kwargs:
-            target_crs (str): target CRS code, passed to rio.reproject()
-            ew (bool): whether to reproject EW data
-            ns (bool): whether to reproject NS data
-            save (bool): whether to overwrite self.es and/or self.ns. If not, just returns reprojected data.
-        
-        Returns:
-            ew_reproj (xarray DataArray) (if ew=True): reprojected East-West data array
-            ns_reproj (xarray DataArray) (if ns=True): reprojected North-South data array
+        Args:
+            profile (ProfileData): profile class with geometry defined (i.e. profile.trace is not None)
+            n_eval_pts (int): the number of evenly-spaced points to evaluate along the profile
         '''
+        (x0, y0), (x1, y1) = profile.linestring.coords[:2]
 
-        self._print("Reprojecting into new coordinate system:", target_crs)
+        xs = np.linspace(x0, x1, n_eval_pts)
+        ys = np.linspace(y0, y1, n_eval_pts)
 
-        if ew:
-            ew_reproj = self.ew.rio.reproject(target_crs)
-            if save: self.ew = ew_reproj
-            if not ns:
-                self._print("... reprojected.")
-                return ew_reproj
-        if ns:
-            ns_reproj = self.ns.rio.reproject(target_crs)
-            if save: self.ns = ns_reproj
-            if not ew:
-                self._print("... reprojected.")
-                return ns_reproj
-        
-        self._print("... reprojected.")
-        return ew_reproj, ns_reproj
+        xs_along_profile = np.hypot(xs - x0, ys - y0)
+
+        theta = np.arctan2(y1-y0, x1-x0)
+
+        parallel = self.ew * np.cos(theta) + self.ns * np.sin(theta)
+        perp = -self.ew * np.sin(theta) + self.ns * np.cos(theta)
+
+        # Interpolate along profile
+        parallel_vals = parallel.interp(
+            x=("points", xs),
+            y=("points", ys)
+        ).values
+        perp_vals = perp.interp(
+            x=("points", xs),
+            y=("points", ys)
+        ).values
+
+        # Pack up into np array
+        displacements = np.array([parallel_vals, perp_vals])
+
+        # Alter profile object
+        profile.displacements = displacements
+        profile.xs = xs_along_profile
+
+        return profile
+    
+
+    ## Helper method to evaluate multiple profiles in one go
+    def evaluate_profiles(self, profiles):
+        return [self.evaluate_profile(p) for p in profiles]
 
 
     ## Helper method to easily plot the optical data using Matplotlib. Provide axes or they will be generated.
-    def plot(self, ew=True, ns=True, title=None):
+    def plot(self, ew=True, ns=True, title=None, fault=None, profiles=None):
 
         '''
         Plots a nice looking map of optical data. Will plot on provided axes if given, else will produce and return a figure.
@@ -175,9 +186,10 @@ class OpticalData:
             ns (bool or Mpl axes): does not plot NS displacement if false, creates axes and plots if True, plots on provided axes if given.
             title (str): Figure title
         '''
+        _self = self._copy()
 
         ####    SET UP FIG, AXES   ####
-        self._print("Plotting...")
+        _self._print("Plotting...")
         n_axs = sum((bool(ew), bool(ns)))   # count number of axes to plot
 
         if ew==True or ns==True:   # create figure if not supplied with axes
@@ -196,25 +208,20 @@ class OpticalData:
             
         
         ####    PLOT THE DATA    ####
-
         axs = []
 
         # EW data
         if ew:
-            ew_latlon = self.reproject("EPSG:4326", ns=False, save=False)
+            ew_latlon = _self.ew.rio.reproject("EPSG:4326")
             ew_latlon.plot(ax=ax_ew, cmap="turbo", add_colorbar=True)
             ax_ew.set_title("EW displacement" if ns else "")
-            # if ns:   # label axis to differentiate from NS if necessary
-            #     ax_ew.annotate("EW displacement", (0.2, 0.15), xycoords="axes fraction")
             axs.append(ax_ew)
         
         # NS data
         if ns:
-            ns_latlon = self.reproject("EPSG:4326", ew=False, save=False)
+            ns_latlon = _self.ew.rio.reproject("EPSG:4326")
             ns_latlon.plot(ax=ax_ns, cmap="turbo", add_colorbar=True)
             ax_ns.set_title("NS displacement" if ew else "")
-            # if ew:   # label axis to differentiate from NS if necessary
-            #     # ax_ns.annotate("NS displacement", (0.2, 0.15), xycoords="axes fraction")
             axs.append(ax_ns)
         
 
@@ -222,6 +229,15 @@ class OpticalData:
         for ax in axs:
             ax.set_xlabel("Latitude (˚)")
             ax.set_ylabel("Longitude (˚)")
+
+            if fault is not None:
+                fault = fault.trace_to_crs("EPSG:4326")
+                fault.trace.plot(ax=ax, color="black", linewidth=2.)
+            if profiles is not None:
+                for p in profiles:
+                    p = p.trace_to_crs("EPSG:4326")
+                    p.trace.plot(ax=ax, color="deeppink", linewidth=1.5)
+
 
 
         ####    RETURN FIG, AXS    ####
@@ -231,7 +247,13 @@ class OpticalData:
         elif ew: res.append(ax_ew)
         elif ns: res.append(ax_ns)
 
-        self._print("... plotted.")
+        _self._print("... plotted.")
         return res
+    
+    ## Helper methods to plot only EW or NS
+    def plot_ew(self, **kwargs):
+        return self.plot(ns=False, **kwargs)
+    def plot_ns(self, **kwargs):
+        return self.plot(ew=False, **kwargs)
 
 
