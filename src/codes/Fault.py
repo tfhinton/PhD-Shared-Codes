@@ -2,7 +2,7 @@ import geopandas as gpd
 import copy
 import numpy as np
 from shapely.geometry import LineString, Point
-from .ProfileData import ProfileData
+from .Profile import Profile
 
 class Fault:
 
@@ -102,7 +102,7 @@ class Fault:
             
             # Pack up into GeoDataFrame
             geoline = gpd.GeoDataFrame({"x_along_fault_trace": [x]}, geometry=[line], crs=self.trace.crs)
-            profile = ProfileData(trace=geoline)
+            profile = Profile(trace=geoline)
             profiles.append(profile)
         
         return profiles

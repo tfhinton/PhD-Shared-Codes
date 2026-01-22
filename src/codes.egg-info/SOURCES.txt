@@ -2,7 +2,8 @@ README.md
 pyproject.toml
 src/codes/Fault.py
 src/codes/OpticalData.py
-src/codes/ProfileData.py
+src/codes/Profile.py
+src/codes/TwoDDzForwardModel.py
 src/codes/__init__.py
 src/codes.egg-info/PKG-INFO
 src/codes.egg-info/SOURCES.txt

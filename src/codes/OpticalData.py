@@ -135,7 +135,7 @@ class OpticalData:
         and profile-perpendicular components.
 
         Args:
-            profile (ProfileData): profile class with geometry defined (i.e. profile.trace is not None)
+            profile (Profile): profile class with geometry defined (i.e. profile.trace is not None)
             n_eval_pts (int): the number of evenly-spaced points to evaluate along the profile
         '''
         (x0, y0), (x1, y1) = profile.linestring.coords[:2]

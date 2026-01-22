@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import copy
 
-class ProfileData:
+class Profile:
 
     '''
     Class to handle displacement profile data (e.g. a 2D profile across an optical image correlation image).

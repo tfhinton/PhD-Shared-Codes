@@ -1,5 +1,7 @@
 from .OpticalData import OpticalData
 from .Fault import Fault
-from .ProfileData import ProfileData
+from .Profile import Profile
+from .TwoDDzForwardModel import TwoDDzForwardModel
+from .Patch import PatchTwoD
 
-__all__ = ["OpticalData", "Fault", "ProfileData"]
+__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "PatchTwoD"]
