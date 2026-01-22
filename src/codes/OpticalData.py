@@ -165,7 +165,7 @@ class OpticalData:
 
         # Alter profile object
         profile.displacements = displacements
-        profile.xs = xs_along_profile
+        profile.xs = xs_along_profile - profile.fault_x
 
         return profile
     

@@ -24,9 +24,10 @@ class TwoDDzForwardModel:
         self.patches = [PatchTwoD()]
         self.slips = np.array([1.])
         self.dz_half_width = 500.
-        self.modulus_ratio = 0.33
+        self.modulus_ratio = 0.5
         self.sol = None
         self.sol_xs = None
+        self.xs = None
     
 
     ## Helper method to return a copy of the class instance
@@ -65,6 +66,28 @@ class TwoDDzForwardModel:
         return _self
     
 
+    # Method for Inversion classes which runs the model based solely on inversion parameters and returns the solution
+    def pred_func(self, p):
+        _self = self._copy()
+        _self.dz_half_width = p[0]
+        _self.slips = p[1:]
+        _self = _self.run(_self.xs)
+        sol = _self.sol
+        return sol
+    
+
+    def plot_inversion_result(self, result, data, title="Compare inversion result to data", plot_kwargs={}):
+        _self = self._copy()
+        _self.dz_half_width = result["mean"]["dz_halfwidth"]
+        _self.slips = result["mean"][1:].to_numpy()
+        _self = _self.run(_self.xs)
+
+        fig, axs = _self.plot(title=title, **plot_kwargs)
+        axs[1].plot(_self.xs, data, label="data", color="grey", zorder=1.5)
+        axs[1].legend()
+
+        return fig, axs
+
     # Helper method to add Gaussian noise to sol
     def add_gaussian_noise(self, std=0.05):
         _self = self._copy()
@@ -75,14 +98,15 @@ class TwoDDzForwardModel:
     
 
     # Helper method to build uniform patches
-    def build_uniform_patches(self, n_patches, dd_width, slip=1.):
+    def build_uniform_patches(self, n_patches, dd_width, initialise_slip=1.):
         _self = self._copy()
 
         patch_width = dd_width / n_patches
         zs = patch_width * (np.arange(n_patches) + 0.5)
 
         _self.patches = [PatchTwoD(0, z, patch_width) for z in zs]
-        _self.slips = np.array([slip] * n_patches)
+        if initialise_slip != False:
+            _self.slips = np.array([initialise_slip] * n_patches)
 
         return _self
     
@@ -107,7 +131,7 @@ class TwoDDzForwardModel:
         return _self
     
     # Quickly plot the displacement solution and slip distribution
-    def plot(self, title=None):
+    def plot(self, title=None, invert_slip_x_axis=False):
         fig, axs = plt.subplots(1,2,layout="constrained",figsize=(10,5), gridspec_kw={'width_ratios': [1,2]})
         if title is not None: fig.suptitle(title)
 
@@ -117,12 +141,15 @@ class TwoDDzForwardModel:
             line_xs.extend([self.slips[i]]*2)
             line_ys.extend([p.top, p.bottom])
         axs[0].plot(line_xs, line_ys, label="Input slip")
+        axs[0].axvline(x=0., color="lightgray", ls="--")
         axs[0].yaxis.set_inverted(True)
+        if invert_slip_x_axis:
+            axs[0].xaxis.set_inverted(True)
         axs[0].set_xlabel("Slip (m)")
         axs[0].set_ylabel("Depth (m)")
         axs[0].legend()
 
-        axs[1].plot(self.sol_xs, self.sol, color="crimson")
+        axs[1].plot(self.sol_xs, self.sol, color="crimson", label="Inverted solution")
         axs[1].set_xlabel("Displacement from fault (m)")
         axs[1].set_ylabel("Vertical displacement (m)")
 

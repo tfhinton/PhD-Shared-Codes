@@ -15,12 +15,11 @@ class Profile:
             the trace and along-trace xs.
     '''
 
-    def __init__(self, trace=None):
-        self.trace = None
+    def __init__(self, trace=None, fault_x=None):
+        self.trace = trace
+        self.fault_x = fault_x
         self.xs = None
         self.displacements = None
-
-        if trace is not None: self.trace = trace
     
 
     ## Helper method to get the trace linestring

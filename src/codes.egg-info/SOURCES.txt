@@ -1,7 +1,9 @@
 README.md
 pyproject.toml
 src/codes/Fault.py
+src/codes/HamiltonianInversion.py
 src/codes/OpticalData.py
+src/codes/Patch.py
 src/codes/Profile.py
 src/codes/TwoDDzForwardModel.py
 src/codes/__init__.py

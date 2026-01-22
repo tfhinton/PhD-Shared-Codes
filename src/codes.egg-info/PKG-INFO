@@ -4,10 +4,12 @@ Version: 0.1.0
 Summary: Utility classes and methods that I use across projects in my PhD, on using high-res geodetic data and probabilistic inversions to probe the damage zone around faults.
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
+Requires-Dist: arviz>=0.16.0
 Requires-Dist: geopandas>=1.0.1
 Requires-Dist: matplotlib>=3.9.4
 Requires-Dist: numba>=0.60.0
 Requires-Dist: numpy>=2.0.2
+Requires-Dist: pymc>=5.12.0
 Requires-Dist: pyproj>=3.6.1
 Requires-Dist: rioxarray>=0.15.0
 Requires-Dist: scipy>=1.13.1

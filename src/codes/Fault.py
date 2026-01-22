@@ -102,7 +102,7 @@ class Fault:
             
             # Pack up into GeoDataFrame
             geoline = gpd.GeoDataFrame({"x_along_fault_trace": [x]}, geometry=[line], crs=self.trace.crs)
-            profile = Profile(trace=geoline)
+            profile = Profile(trace=geoline, fault_x=half_length)
             profiles.append(profile)
         
         return profiles
