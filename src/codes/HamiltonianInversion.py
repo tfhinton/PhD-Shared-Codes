@@ -2,6 +2,7 @@ import pymc as pm
 import arviz as az
 import numpy as np
 import copy
+from .utils import get_maps_from_arviz
 
 class HamiltonianInversion:
 
@@ -24,10 +25,15 @@ class HamiltonianInversion:
         self.Cd = data_covariance
         self.verbose = True
         self.result = None
+        self.ppc = None
     
     @property
     def prior_vals(self):
         return np.array([p.val for p in self.priors])
+    
+    @property
+    def prior_labels(self):
+        return np.array([p.label for p in self.priors])
     
     def _copy(self):
         return copy.copy(self)
@@ -88,10 +94,74 @@ class HamiltonianInversion:
             pm.MvNormal("obs", mu=mu, chol=L, observed=_self.data)
 
             # Invert
-            trace = pm.sample(draws=1000, tune=1000, chains=4, target_accept=0.9, return_inferencedata=True)
+            result = pm.sample(draws=1000, tune=1000, chains=4, target_accept=0.9, return_inferencedata=True)
+        
+        # posterior predictive (linearized)
+        with model:
+            ppc = pm.sample_posterior_predictive(result, var_names=["obs"])
 
-        result = az.summary(trace, var_names=[p.label for p in _self.priors])
         _self.result = result
+        _self.ppc = ppc
 
         return _self
+            
+
+    def plot_chains(self, var_names=None, title="Distributions and evolutions of Markov chains"):
+        if var_names is None:
+            var_names = self.prior_labels[:5]
+        
+        axs = az.plot_trace(self.result, var_names=var_names)
+        fig = axs.flatten()[0].get_figure()
+        fig.suptitle(title)
+
+        return fig, axs
+    
+
+    def plot_posterior(self, var_names=None, title="Posterior distributions of inverted model parameters"):
+        if var_names is None:
+            var_names = self.prior_labels[:5]
+        
+        axs = az.plot_posterior(self.result, var_names=var_names)
+        fig = axs.flatten()[0].get_figure()
+        fig.suptitle(title)
+
+        return fig, axs
+    
+
+    def plot_tradeoffs(self, var_names=None, title="Covariance between inverted model parameters"):
+        if var_names is None:
+            var_names = self.prior_labels[:5]
+
+        axs = az.plot_pair(self.result, var_names=var_names, kind="kde")
+        fig = axs.flatten()[0].get_figure()
+        fig.suptitle(title)
+
+        return fig, axs
+    
+
+    def plot_ppc(self, title="Compare posterior distribution to observed data distribution"):
+        ax = az.plot_ppc(self.ppc, data_pairs={"obs": "obs"})
+        fig = ax.get_figure()
+        fig.suptitle(title)
+
+        return fig, ax
+    
+
+    def diagnostics(self, var_names=None):
+        kwarg = {}
+        if var_names is not None: kwarg["var_names"] = var_names
+
+        print(az.summary(self.result, var_names=self.prior_labels))
+        self.plot_chains(**kwarg)
+        self.plot_posterior(**kwarg)
+        self.plot_tradeoffs(**kwarg)
+        self.plot_ppc()
+
+
+        
+
+
+
+
+
         

@@ -5,5 +5,7 @@ from .TwoDDzForwardModel import TwoDDzForwardModel
 from .Patch import PatchTwoD
 from .Dist import UniformDist, GaussianDist
 from .HamiltonianInversion import HamiltonianInversion
+from .InversionManager import InversionManager
+from . import utils
 
-__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion"]
+__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "utils"]

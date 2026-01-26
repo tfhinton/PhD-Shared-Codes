@@ -3,6 +3,8 @@ from numba import njit
 import copy
 import matplotlib.pyplot as plt
 from .Patch import PatchTwoD
+from .utils import get_maps_from_arviz
+import arviz as az
 
 class TwoDDzForwardModel:
 
@@ -78,13 +80,41 @@ class TwoDDzForwardModel:
 
     def plot_inversion_result(self, result, data, title="Compare inversion result to data", plot_kwargs={}):
         _self = self._copy()
-        _self.dz_half_width = result["mean"]["dz_halfwidth"]
-        _self.slips = result["mean"][1:].to_numpy()
+        plot_kwargs["slip_label"] = "Inferred slip"
+
+        maps = get_maps_from_arviz(result)
+        _self.dz_half_width = maps[0]
+        _self.slips = maps[1:]
         _self = _self.run(_self.xs)
 
         fig, axs = _self.plot(title=title, **plot_kwargs)
         axs[1].plot(_self.xs, data, label="data", color="grey", zorder=1.5)
         axs[1].legend()
+
+        ax_inset = axs[1].inset_axes([0.12, 0.12, 0.27, .33])
+        dzgrid, dzkde = az.kde( result.posterior["dz_halfwidth"].values.flatten() )
+        ax_inset.plot(dzgrid, dzkde)
+        ax_inset.set_xlabel("DZ halfwidth (m)", size=9)
+        ax_inset.set_ylabel("PDF", size=9)
+        ax_inset.set_title("Damage zone halfwidth PDF", size=11)
+        ax_inset.tick_params(labelsize=8)
+
+        ####    Plot PDF as background colour   ####
+        labels = list(result.posterior.keys())[1:]
+
+        for label, patch in zip(labels, _self.patches):
+            samples = result.posterior[label].values.flatten()
+            grid, kde = az.kde(samples)
+
+            grid_spacing = grid[1]-grid[0]
+            grid = grid - grid_spacing/2
+            grid = np.append(grid, grid[-1] + grid_spacing)
+            grid = np.repeat(grid[:,None], 2, axis=1).T
+
+            zs = np.array([patch.top, patch.bottom])
+            zs = np.repeat(zs[:,None], grid.shape[1], axis=1)
+
+            axs[0].pcolormesh(grid, zs, kde[:,None].T, shading="flat", cmap="Blues", alpha=0.5, zorder=1.5)
 
         return fig, axs
 
@@ -131,7 +161,7 @@ class TwoDDzForwardModel:
         return _self
     
     # Quickly plot the displacement solution and slip distribution
-    def plot(self, title=None, invert_slip_x_axis=False):
+    def plot(self, title=None, invert_slip_x_axis=False, slip_label="Input slip"):
         fig, axs = plt.subplots(1,2,layout="constrained",figsize=(10,5), gridspec_kw={'width_ratios': [1,2]})
         if title is not None: fig.suptitle(title)
 
@@ -140,7 +170,7 @@ class TwoDDzForwardModel:
         for i, p in enumerate(self.patches):
             line_xs.extend([self.slips[i]]*2)
             line_ys.extend([p.top, p.bottom])
-        axs[0].plot(line_xs, line_ys, label="Input slip")
+        axs[0].plot(line_xs, line_ys, label=slip_label)
         axs[0].axvline(x=0., color="lightgray", ls="--")
         axs[0].yaxis.set_inverted(True)
         if invert_slip_x_axis:
