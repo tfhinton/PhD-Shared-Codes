@@ -128,7 +128,7 @@ class OpticalData:
     
 
     ## Method to evaluate displacement along a given profile
-    def evaluate_profile(self, profile, n_eval_pts=200):
+    def evaluate_profile(self, profile, n_eval_pts=400):
 
         '''
         Evaluate displacement along a profile given a profile geometry. Rotates EW and NS into profile-parallel
@@ -138,36 +138,40 @@ class OpticalData:
             profile (Profile): profile class with geometry defined (i.e. profile.trace is not None)
             n_eval_pts (int): the number of evenly-spaced points to evaluate along the profile
         '''
-        (x0, y0), (x1, y1) = profile.linestring.coords[:2]
+        lines = profile.trace.geometry.values
+        displacements = np.zeros((2,n_eval_pts,len(lines)))
+        for i, line in enumerate(lines):
+            (x0, y0), (x1, y1) = line.coords[:2]
 
-        xs = np.linspace(x0, x1, n_eval_pts)
-        ys = np.linspace(y0, y1, n_eval_pts)
+            xs = np.linspace(x0, x1, n_eval_pts)
+            ys = np.linspace(y0, y1, n_eval_pts)
 
-        xs_along_profile = np.hypot(xs - x0, ys - y0)
+            xs_along_profile = np.hypot(xs - x0, ys - y0)
 
-        theta = np.arctan2(y1-y0, x1-x0)
+            theta = np.arctan2(y1-y0, x1-x0)
 
-        parallel = self.ew * np.cos(theta) + self.ns * np.sin(theta)
-        perp = -self.ew * np.sin(theta) + self.ns * np.cos(theta)
+            parallel = self.ew * np.cos(theta) + self.ns * np.sin(theta)
+            perp = -self.ew * np.sin(theta) + self.ns * np.cos(theta)
 
-        # Interpolate along profile
-        parallel_vals = parallel.interp(
-            x=("points", xs),
-            y=("points", ys)
-        ).values
-        perp_vals = perp.interp(
-            x=("points", xs),
-            y=("points", ys)
-        ).values
+            # Interpolate along profile
+            parallel_vals = parallel.interp(
+                x=("points", xs),
+                y=("points", ys)
+            ).values
+            perp_vals = perp.interp(
+                x=("points", xs),
+                y=("points", ys)
+            ).values
 
-        # Pack up into np array
-        displacements = np.array([parallel_vals, perp_vals])
+            # Pack up into np array
+            displacements[:, :, i] = np.array([parallel_vals, perp_vals])
 
         # Alter profile object
-        profile.displacements = displacements
+        profile.displacements = np.mean(displacements, axis=2)
         profile.xs = xs_along_profile - profile.fault_x
 
         return profile
+
     
 
     ## Helper method to evaluate multiple profiles in one go

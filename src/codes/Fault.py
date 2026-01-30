@@ -56,7 +56,7 @@ class Fault:
     
 
     ## Method to generate programatically profile lines perpendicular to the fault trace
-    def gen_profiles(self, n_profiles=10, half_length=5000.):
+    def gen_profiles(self, n_profiles=10, half_length=5000., n_in_swathe=10, swathe_separation=5.):
         '''
         Generate multiple profile lines perpendicular to a fault trace, spaced evenly along the fault (includes the start and end of fault).
 
@@ -69,40 +69,56 @@ class Fault:
         '''
 
         # Choose where to sample along fault trace
-        xs = np.linspace(0, self.trace.length[0], n_profiles)
+        x_len = self.trace.length[0]
+        xs = np.linspace(0, x_len, n_profiles)
         profiles = []
 
         # For each sampling point
         for x in xs:
-            point = self.trace.interpolate(x)
+            halfwidth = (n_in_swathe*swathe_separation)/2
+            start = max(x-halfwidth, 0)
+            end = min(start+2*halfwidth, x_len)
 
-            # Offset slightly to estimate tangent
-            eps = 1.
-            p1 = self.trace.interpolate(max(x-eps, 0))
-            p2 = self.trace.interpolate(min(x+eps, self.trace.length[0]))
-
-            dx = p2.x - p1.x
-            dy = p2.y - p1.y
-
-            # Calculate normalised perpendicular direction
-            len = np.hypot(dx, dy)
-            nx = -dy/len
-            ny = dx/len
-
-            # Create profile line object
-            start = Point(
-                point.x - nx * half_length,
-                point.y - ny * half_length
-            )
-            end = Point(
-                point.x + nx * half_length,
-                point.y + ny * half_length
-            )
-            line = LineString([start, end])
+            geometries = []
+            dists = []
+            for n in np.linspace(start, end, n_in_swathe):
+                line = profile_geom(self.trace, n, half_length)
+                geometries.append(line)
+                dists.append(n)
             
             # Pack up into GeoDataFrame
-            geoline = gpd.GeoDataFrame({"x_along_fault_trace": [x]}, geometry=[line], crs=self.trace.crs)
-            profile = Profile(trace=geoline, fault_x=half_length)
+            geolines = gpd.GeoDataFrame({"x_along_fault_trace": dists}, geometry=geometries, crs=self.trace.crs)
+            profile = Profile(trace=geolines, fault_x=half_length)
             profiles.append(profile)
         
         return profiles
+
+
+def profile_geom(trace_gdf, x, half_length):
+    point = trace_gdf.interpolate(x)
+
+    # Offset slightly to estimate tangent
+    eps = 1.
+    p1 = trace_gdf.interpolate(max(x-eps, 0))
+    p2 = trace_gdf.interpolate(min(x+eps, trace_gdf.length[0]))
+
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+
+    # Calculate normalised perpendicular direction
+    len = np.hypot(dx, dy)
+    nx = -dy/len
+    ny = dx/len
+
+    # Create profile line object
+    start = Point(
+        point.x - nx * half_length,
+        point.y - ny * half_length
+    )
+    end = Point(
+        point.x + nx * half_length,
+        point.y + ny * half_length
+    )
+
+    line = LineString([start, end])
+    return line
