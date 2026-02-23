@@ -23,7 +23,7 @@ class Fault:
     def import_trace(self, filepath=None, crs=None):
 
         '''
-        Read a .shp shapefile to a GeoPandas data frame and save to self.fault
+        Read a .shp shapefile to a GeoPandas data frame and save to self.trace
 
         Args:
             filepath (str): filepath of .shp fault trace file
@@ -36,6 +36,13 @@ class Fault:
             self.trace = self.trace_to_crs(crs).trace
         return self
     
+
+    ## Import patches from .mesh.triangles file
+    def import_patches(self, filepath=None):
+
+        '''
+        Read 
+        '''
 
     ## Helper method to return a copy of the class instance
     def _copy(self):

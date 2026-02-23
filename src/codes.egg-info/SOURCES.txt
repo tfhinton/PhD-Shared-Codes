@@ -4,11 +4,13 @@ src/codes/Dist.py
 src/codes/Fault.py
 src/codes/HamiltonianInversion.py
 src/codes/InversionManager.py
+src/codes/Okada3DForwardModel.py
 src/codes/OpticalData.py
 src/codes/Patch.py
 src/codes/Profile.py
 src/codes/TwoDDzForwardModel.py
 src/codes/__init__.py
+src/codes/meade07.py
 src/codes/utils.py
 src/codes.egg-info/PKG-INFO
 src/codes.egg-info/SOURCES.txt

@@ -2,8 +2,9 @@ import numpy as np
 from numba import njit
 import copy
 import matplotlib.pyplot as plt
+import matplotlib.colors as clr
 from .Patch import PatchTwoD
-from .utils import get_maps_from_arviz
+from .utils import get_maps_from_arviz, get_medians_from_arviz
 import arviz as az
 
 class TwoDDzForwardModel:
@@ -78,29 +79,32 @@ class TwoDDzForwardModel:
         return sol
     
 
-    def plot_inversion_result(self, result, data, title="Compare inversion result to data", plot_kwargs={}):
+    def plot_inversion_result(self, result, data, title="Compare inversion result to data", true_slips=None, true_dz=None, plot_kwargs={}, savefig=None):
         _self = self._copy()
         plot_kwargs["slip_label"] = "Inferred slip"
 
-        maps = get_maps_from_arviz(result)
+        maps = get_medians_from_arviz(result)
         _self.dz_half_width = maps[0]
         _self.slips = maps[1:]
         _self = _self.run(_self.xs)
 
-        fig, axs = _self.plot(title=title, **plot_kwargs)
-        axs[1].plot(_self.xs, data, label="data", color="grey", zorder=1.5)
+        fig, axs = _self.plot(title=title, true_slips=true_slips, **plot_kwargs)
+        axs[1].plot(_self.xs, data, label="Synthetic data", color="grey", zorder=1.5)
         axs[1].legend()
 
-        ax_inset = axs[1].inset_axes([0.12, 0.12, 0.27, .33])
+        ax_inset = axs[1].inset_axes([0.12, 0.6, 0.27, .31])
+        if true_dz is not None:
+            ax_inset.axvline(true_dz, color="grey", ls="--")
         dzgrid, dzkde = az.kde( result.posterior["dz_halfwidth"].values.flatten() )
         ax_inset.plot(dzgrid, dzkde)
         ax_inset.set_xlabel("DZ halfwidth (m)", size=9)
         ax_inset.set_ylabel("PDF", size=9)
-        ax_inset.set_title("Damage zone halfwidth PDF", size=11)
+        ax_inset.set_title("Damage zone halfwidth PDF", size=10)
         ax_inset.tick_params(labelsize=8)
 
         ####    Plot PDF as background colour   ####
         labels = list(result.posterior.keys())[1:]
+        cmap = clr.LinearSegmentedColormap.from_list("lightblues", ["white", "lightskyblue"])
 
         for label, patch in zip(labels, _self.patches):
             samples = result.posterior[label].values.flatten()
@@ -114,8 +118,10 @@ class TwoDDzForwardModel:
             zs = np.array([patch.top, patch.bottom])
             zs = np.repeat(zs[:,None], grid.shape[1], axis=1)
 
-            axs[0].pcolormesh(grid, zs, kde[:,None].T, shading="flat", cmap="Blues", alpha=0.5, zorder=1.5)
+            axs[0].pcolormesh(grid, zs, kde[:,None].T, shading="flat", cmap=cmap, alpha=0.5, zorder=1.5)
 
+        if savefig is not None:
+            fig.savefig(savefig, dpi=300.)
         return fig, axs
 
     # Helper method to add Gaussian noise to sol
@@ -161,9 +167,20 @@ class TwoDDzForwardModel:
         return _self
     
     # Quickly plot the displacement solution and slip distribution
-    def plot(self, title=None, invert_slip_x_axis=False, slip_label="Input slip"):
-        fig, axs = plt.subplots(1,2,layout="constrained",figsize=(10,5), gridspec_kw={'width_ratios': [1,2]})
+    def plot(self, title=None, invert_slip_x_axis=False, slip_label="Input slip", true_slips=None, xlim=None, axtitles=None):
+        fig, axs = plt.subplots(1,2,layout="constrained",figsize=(10,5), gridspec_kw={'width_ratios': [1,2], "wspace": 0.07})
         if title is not None: fig.suptitle(title)
+        if axtitles is not None:
+            axs[0].set_title(axtitles[0])
+            axs[1].set_title(axtitles[1])
+
+        if true_slips is not None:
+            line_xs = []
+            line_ys = []
+            for i, p in enumerate(self.patches):
+                line_xs.extend([true_slips[i]]*2)
+                line_ys.extend([p.top, p.bottom])
+            axs[0].plot(line_xs, line_ys, label="True slip", color="grey")
 
         line_xs = []
         line_ys = []
@@ -175,13 +192,15 @@ class TwoDDzForwardModel:
         axs[0].yaxis.set_inverted(True)
         if invert_slip_x_axis:
             axs[0].xaxis.set_inverted(True)
+        if xlim is not None:
+            axs[0].set_xlim(xlim)
         axs[0].set_xlabel("Slip (m)")
         axs[0].set_ylabel("Depth (m)")
         axs[0].legend()
 
         axs[1].plot(self.sol_xs, self.sol, color="crimson", label="Inverted solution")
-        axs[1].set_xlabel("Displacement from fault (m)")
-        axs[1].set_ylabel("Vertical displacement (m)")
+        axs[1].set_xlabel("Distance from fault (m)")
+        axs[1].set_ylabel("Horizontal displacement (m)")
 
         return fig, axs
             

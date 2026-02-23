@@ -13,6 +13,7 @@ Requires-Dist: pymc>=5.12.0
 Requires-Dist: pyproj>=3.6.1
 Requires-Dist: rioxarray>=0.15.0
 Requires-Dist: scipy>=1.13.1
+Requires-Dist: seaborn>=0.13.2
 Requires-Dist: shapely>=2.0.7
 
 This package contains codes that I use across various projects in my PhD, which is using high-resolution data (geodetic, seismic, etc) and probabilistic inversions to study the damage zone around faults.
