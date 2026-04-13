@@ -1,0 +1,36 @@
+reset
+cd "/home/hintont/projects/pylith-test"
+${Units('si')}
+
+# parameters
+#{min_mesh_size = 1.5*km}
+#{min_mesh_angle = 15}
+#{mesh_gradation = 1.2}
+
+# import geometry (from base_geom.jou) and imprint
+import acis "base_geom.sat"
+imprint all
+merge all
+
+# triangular meshing of fault and damage zone surfaces
+Trimesher geometry sizing off
+surface in volume 1 4 with z_coord < 0 scheme trimesh geometry approximation angle {min_mesh_angle} minimum size {min_mesh_size}
+surface in volume 1 4 with z_coord < 0 size {min_mesh_size}
+mesh surface in volume 1 4 with z_coord < 0
+
+# set uniform mesh size in damage zone
+volume 1 2 4 scheme tetmesh geometry approximation angle {min_mesh_angle}
+volume 1 tetmesh respect tri in surface in volume 1
+volume 4 tetmesh respect tri in surface in volume 4
+volume 1 4 size {min_mesh_size}
+
+# set distance-based meshing outside damage zone
+set Trimesher Surface Gradation {mesh_gradation}
+set Trimesher Volume Gradation {mesh_gradation}
+# volume 2 tetmesh respect tri in surface 2 3 4 5 6 10 20 21 22 23
+volume 2 tetmesh respect tri in surface 3 4 5 6 # surfaces shared by vol 1 (damage zone) and vol 2 (lithosphere)
+volume 2 tetmesh respect tri in surface 9 21 22 23  # surfaces shared by vol 4 (damage zone @ A) and vol 2 (lithosphere)
+
+# generate the mesh
+set keep invalid mesh on
+mesh volume 1 2 4

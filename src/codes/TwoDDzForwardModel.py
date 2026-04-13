@@ -23,11 +23,11 @@ class TwoDDzForwardModel:
         sol_xs (np array, dim x): x inputs to the forward model
     '''
 
-    def __init__(self, **set_params_kwargs):
+    def __init__(self, dz_half_width=500., modulus_ratio=0.5, **set_params_kwargs):
         self.patches = [PatchTwoD()]
         self.slips = np.array([1.])
-        self.dz_half_width = 500.
-        self.modulus_ratio = 0.5
+        self.dz_half_width = dz_half_width
+        self.modulus_ratio = modulus_ratio
         self.sol = None
         self.sol_xs = None
         self.xs = None
@@ -43,7 +43,7 @@ class TwoDDzForwardModel:
         
         # Estimate length of series required for convergence
         tol = 1e-6
-        m_max = int(np.ceil(np.log(tol) / np.log(abs(modulus_ratio))))
+        m_max = int(np.ceil(np.log(tol) / np.log(abs((1-modulus_ratio) / (1+modulus_ratio)))))
 
         # Compute solution down to bottom
         sol = compute_two_d_dz(xs, patch.bottom, slip, dz_half_width, modulus_ratio, m_max)
@@ -216,7 +216,7 @@ def compute_two_d_dz(xs, depth, slip, dz_half_width, modulus_ratio, m_max):
     # Rename variables
     u = slip
     dz = dz_half_width
-    k = modulus_ratio
+    k = (1-modulus_ratio) / (1+modulus_ratio)
     d = depth
 
     # Loop through xs

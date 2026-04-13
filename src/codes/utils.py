@@ -28,3 +28,11 @@ def get_medians_from_arviz(inference_data):
         medians.append( median )
         
     return np.array(medians)
+
+def plot_slip_profile(ax, patches, slips, plot_kwargs={}):
+    line_xs = []
+    line_ys = []
+    for i, p in enumerate(patches):
+        line_xs.extend([slips[i]]*2)
+        line_ys.extend([p.top, p.bottom])
+    ax.plot(line_xs, line_ys, **plot_kwargs)

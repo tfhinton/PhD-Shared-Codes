@@ -1,0 +1,10 @@
+xtick.labelsize : 10
+ytick.labelsize : 10
+axes.linewidth: 0.85
+axes.edgecolor: (0.65,0.65,0.65)
+xtick.major.width: 0.85
+xtick.color: (0.65,0.65,0.65)
+xtick.labelcolor: black
+ytick.major.width: 0.85
+ytick.color: (0.65,0.65,0.65)
+ytick.labelcolor: black
