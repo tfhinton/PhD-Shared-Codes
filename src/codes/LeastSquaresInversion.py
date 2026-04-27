@@ -16,10 +16,11 @@ class LeastSquaresInversion:
         data_covariance
     '''
 
-    def __init__(self, forward_model, p0, data, verbose=True):
+    def __init__(self, forward_model, p0, data, pred_func_args={}, verbose=True):
         self.forward = forward_model
         self.p0 = p0
         self.data = data
+        self.pred_func_args = pred_func_args
         self.verbose = verbose
         self.result = None
     
@@ -30,12 +31,11 @@ class LeastSquaresInversion:
     def _print(self, *args, **kwargs):
         if self.verbose: print(*args, **kwargs)
     
-    def run(self, eps_val=1.e-3):
+    def run(self):
         _self = self._copy()
         _self._print("Starting inversion...")
-
         def loss_func(p):
-            pred = _self.forward.pred_func(p)
+            pred = _self.forward.pred_func(p, **_self.pred_func_args)
             misfit = np.linalg.norm(pred - _self.data)
             return misfit
         res = optimize.minimize(loss_func, _self.p0, method="Nelder-Mead")

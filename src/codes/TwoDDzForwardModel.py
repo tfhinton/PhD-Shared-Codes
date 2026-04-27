@@ -23,14 +23,14 @@ class TwoDDzForwardModel:
         sol_xs (np array, dim x): x inputs to the forward model
     '''
 
-    def __init__(self, dz_half_width=500., modulus_ratio=0.5, **set_params_kwargs):
-        self.patches = [PatchTwoD()]
+    def __init__(self, dz_half_width=500., modulus_ratio=0.5, locking_depth=10000., xs=None, **set_params_kwargs):
+        self.patches = [PatchTwoD(0, locking_depth/2, locking_depth)]
         self.slips = np.array([1.])
         self.dz_half_width = dz_half_width
         self.modulus_ratio = modulus_ratio
         self.sol = None
         self.sol_xs = None
-        self.xs = None
+        self.xs = xs
     
 
     ## Helper method to return a copy of the class instance

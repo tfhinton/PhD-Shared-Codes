@@ -42,59 +42,74 @@ class HamiltonianInversion:
     def _print(self, *args, **kwargs):
         if self.verbose: print(*args, **kwargs)
     
-    def run(self, eps_val=1.e-3):
+    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4):
         _self = self._copy()
         _self._print("Starting inversion...")
 
 
-        ####    LINEAR ESTIMATION OF GRADIENT IN GREENS FUNCTION    ####
-        p0 = _self.prior_vals
-        preds0 = _self.forward.pred_func( p0 )
-        eps = np.full_like( p0, eps_val )
-        eps = eps * np.abs(p0)
-        len_xs = len(_self.forward.xs)
-        G = np.zeros((len_xs, p0.size))
+        cd_inv = np.linalg.inv(_self.Cd)
 
-        _self._print(f"Linear estimation of gradient in Greens function ({p0.size})")
-        for i in range(p0.size):
-            _self._print(f"p{i}", end=" ")
-            dp = np.zeros_like(p0)
-            dp[i] = eps[i]
-            plus = _self.forward.pred_func(p0 + dp)
-            minus = _self.forward.pred_func(p0 - dp)
-            G[:, i] = (plus - minus) / (2.0 * dp[i])
-        _self._print("\n... estimation complete:")
-        
+        # Wrap pred_func as a PyTensor/Theano op so PyMC can differentiate through it.
+        # For NUTS (gradient-based), we use a black-box op with finite-difference gradients.
+        from pytensor.graph.op import Op
+        import pytensor.tensor as pt
 
-        ####    CHOLESKY FACTORISATION    ####
-        jitter = 1e-10 * np.trace(_self.Cd) / len_xs
-        max_tries = 10
-        _self._print("Cholesky factorisation...")
-        for _ in range(max_tries):
-            try:
-                L = np.linalg.cholesky(_self.Cd + jitter * np.eye(len_xs))
-                break
-            except np.linalg.LinAlgError:
-                jitter *= 10.0
-        else:
-            raise RuntimeError("Failed to get Cholesky; increase jitter or check covariance matrix")
-        _self._print("... factorisation complete.")
+        class ForwardOp(Op):
+            itypes = [pt.dvector]
+            otypes = [pt.dvector]
 
-        
-        ####    RUN INVERSION    ####
+            def perform(_, node, inputs, outputs):
+                params = inputs[0]
+                outputs[0][0] = _self.forward.pred_func(params).astype(np.float64)
+
+            def grad(_, inputs, output_grads):
+                # Finite-difference Jacobian for the black-box forward model
+                params = inputs[0]
+                g = output_grads[0]
+                return [ForwardOpGrad()(params, g)]
+
+        class ForwardOpGrad(Op):
+            itypes = [pt.dvector, pt.dvector]
+            otypes = [pt.dvector]
+            eps = 1e-5
+
+            def perform(_, node, inputs, outputs):
+                params, g = inputs
+                n = len(params)
+                pred0 = _self.forward.pred_func(params)
+                jac = np.zeros((len(pred0), n))
+                for i in range(n):
+                    p_pert = params.copy()
+                    p_pert[i] += _.eps
+                    jac[:, i] = (_self.forward.pred_func(p_pert) - pred0) / _.eps
+                outputs[0][0] = jac.T @ g
+
+        forward_op = ForwardOp()
+
         with pm.Model() as model:
+            # Build priors from UniformDist objects
+            param_vars = [p.pm for p in _self.priors]
 
-            # Stack priors
-            priors = pm.math.stack([p.pm for p in _self.priors])
+            # Stack into a single vector for pred_func
+            params_vec = pt.stack(param_vars)
 
-            # Linearized predictive mean using pm.math.dot
-            mu = preds0 + pm.math.dot(G, priors - p0)
+            # Forward model prediction
+            pred = forward_op(params_vec)
 
-            # Multivariate normal likelihood (chol accepts a numpy array)
-            pm.MvNormal("obs", mu=mu, chol=L, observed=_self.data)
+            # Log-likelihood: -0.5 * (d - pred)^T Cd^{-1} (d - pred)
+            residual = _self.data - pred
+            log_like = -0.5 * pt.dot(residual, pt.dot(cd_inv, residual))
+            pm.Potential("obs", log_like)
 
-            # Invert
-            result = pm.sample(draws=1000, tune=1000, chains=4, target_accept=0.9, return_inferencedata=True)
+            # Sample with NUTS (the HMC variant PyMC uses by default)
+            result = pm.sample(
+                draws=draws,
+                tune=tune,
+                target_accept=target_accept,   # increase for more complex posteriors
+                chains=chains,
+                return_inferencedata=True,
+                progressbar=True,
+            )
         
         # posterior predictive (linearized)
         with model:
@@ -133,7 +148,7 @@ class HamiltonianInversion:
             var_names = self.prior_labels[:5]
 
         axs = az.plot_pair(self.result, var_names=var_names, kind="kde")
-        fig = axs.flatten()[0].get_figure()
+        fig = np.atleast_2d(axs).flatten()[0].get_figure()
         fig.suptitle(title)
 
         return fig, axs
@@ -156,6 +171,10 @@ class HamiltonianInversion:
         self.plot_posterior(**kwarg)
         self.plot_tradeoffs(**kwarg)
         self.plot_ppc()
+
+    def print_summary(self):
+        print(az.summary(self.result, var_names=self.prior_labels))
+    
 
 
         
