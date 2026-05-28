@@ -1,4 +1,5 @@
 arviz>=0.16.0
+cmcrameri>=1.9
 geopandas>=1.0.1
 matplotlib>=3.9.4
 numba>=0.60.0

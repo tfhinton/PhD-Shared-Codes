@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 
 dependencies = [
     "arviz>=0.16.0",
+    "cmcrameri>=1.9",
     "geopandas>=1.0.1",
     # Add runtime dependencies here
     "matplotlib>=3.9.4",

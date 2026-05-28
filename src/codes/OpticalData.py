@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import copy
+import cmcrameri.cm as cmc
 
 ###   OpticalData class
 class OpticalData:
@@ -126,6 +127,13 @@ class OpticalData:
         _self._print("")
         return _self
     
+    def get_window(self, x0, x1, y0, y1, ew=True, ns=True):
+        _self = self._copy()
+        if ew:
+            _self.ew = _self.ew.sel(x=slice(x0,x1), y=slice(y0,y1))
+        if ns:
+            _self.ns = _self.ns.sel(x=slice(x0,x1), y=slice(y0,y1))
+        return _self
 
     ## Method to evaluate displacement along a given profile
     def evaluate_profile(self, profile, n_eval_pts=400):
@@ -180,7 +188,7 @@ class OpticalData:
 
 
     ## Helper method to easily plot the optical data using Matplotlib. Provide axes or they will be generated.
-    def plot(self, ew=True, ns=True, title=None, fault=None, profiles=None):
+    def plot(self, ew=True, ns=True, title=None, fault=None, profiles=None, cmap=cmc.vik, xlim=None, ylim=None):
 
         '''
         Plots a nice looking map of optical data. Will plot on provided axes if given, else will produce and return a figure.
@@ -190,6 +198,8 @@ class OpticalData:
             ns (bool or Mpl axes): does not plot NS displacement if false, creates axes and plots if True, plots on provided axes if given.
             title (str): Figure title
         '''
+        from matplotlib.patches import FancyBboxPatch
+
         _self = self._copy()
 
         ####    SET UP FIG, AXES   ####
@@ -197,37 +207,44 @@ class OpticalData:
         n_axs = sum((bool(ew), bool(ns)))   # count number of axes to plot
 
         if ew==True or ns==True:   # create figure if not supplied with axes
-            fig = plt.figure(figsize=(2+5*n_axs, 6), layout="constrained")
+            fig = plt.figure(figsize=(1.5+4.5*n_axs, 5), layout="constrained")
             if title is not None: fig.suptitle(title)
-        
+
         if isinstance(ew, mpl.axes.Axes):    # if supplied EW axis to plot, save reference
             ax_ew = ew
         elif ew:   # else if plotting EW axis, create axis and add to figure
             ax_ew = fig.add_subplot(101+10*n_axs)
-        
+
         if isinstance(ns, mpl.axes.Axes):   # if supplied NS axis to plot, save reference
             ax_ns = ns
         elif ns:   # else if plotting NS axis, create axis and add to figure
             ax_ns = fig.add_subplot(100+11*n_axs)
-            
-        
+
+
         ####    PLOT THE DATA    ####
         axs = []
+        _cb_data = []  # (label, image_artist, axis)
 
         # EW data
         if ew:
             ew_latlon = _self.ew.rio.reproject("EPSG:4326")
-            ew_latlon.plot(ax=ax_ew, cmap="turbo", add_colorbar=True)
+            if xlim is not None and ylim is not None:
+                ew_latlon = ew_latlon.sel(x=slice(xlim[0], xlim[1]), y=slice(ylim[1], ylim[0]))
+            im_ew = ew_latlon.plot(ax=ax_ew, cmap=cmap, add_colorbar=False)
             ax_ew.set_title("EW displacement" if ns else "")
             axs.append(ax_ew)
-        
+            _cb_data.append(("East-west displacement (m)", im_ew, ax_ew))
+
         # NS data
         if ns:
-            ns_latlon = _self.ew.rio.reproject("EPSG:4326")
-            ns_latlon.plot(ax=ax_ns, cmap="turbo", add_colorbar=True)
+            ns_latlon = _self.ns.rio.reproject("EPSG:4326")
+            if xlim is not None and ylim is not None:
+                ns_latlon = ns_latlon.sel(x=slice(xlim[0], xlim[1]), y=slice(ylim[1], ylim[0]))
+            im_ns = ns_latlon.plot(ax=ax_ns, cmap=cmap, add_colorbar=False)
             ax_ns.set_title("NS displacement" if ew else "")
             axs.append(ax_ns)
-        
+            _cb_data.append(("North-south displacement (m)", im_ns, ax_ns))
+
 
         ####    CONFIGURE PLOTS    ####
         for ax in axs:
@@ -242,6 +259,40 @@ class OpticalData:
                     p = p.trace_to_crs("EPSG:4326")
                     p.trace.plot(ax=ax, color="deeppink", linewidth=1.5)
 
+            # Scale bar (lower left), auto-sized to ~20% of plot width
+            x_min, x_max = ax.get_xlim()
+            y_min, y_max = ax.get_ylim()
+            lat_c = (y_min + y_max) / 2
+            km_per_deg = np.cos(np.radians(lat_c)) * 111.32
+            bar_km_target = 0.2 * (x_max - x_min) * km_per_deg
+            nice_km = [1, 2, 5, 10, 20, 50, 100, 200, 500]
+            bar_km = min(nice_km, key=lambda v: abs(v - bar_km_target))
+            bar_deg = bar_km / km_per_deg
+            x_range, y_range = x_max - x_min, y_max - y_min
+            bar_x0 = x_min + 0.05 * x_range
+            bar_y0 = y_min + 0.05 * y_range
+            bar_tick_h = 0.01 * y_range
+            ax.plot([bar_x0, bar_x0 + bar_deg], [bar_y0, bar_y0],
+                    color="black", linewidth=2.5, zorder=5, solid_capstyle="butt")
+            ax.plot([bar_x0, bar_x0], [bar_y0, bar_y0 + bar_tick_h], color="black", linewidth=2.5, zorder=5)
+            ax.plot([bar_x0 + bar_deg, bar_x0 + bar_deg], [bar_y0, bar_y0 + bar_tick_h], color="black", linewidth=2.5, zorder=5)
+            ax.text(bar_x0 + bar_deg / 2, bar_y0 + 0.012 * y_range,
+                    f"{bar_km:.0f} km", ha="center", va="bottom", fontsize=10., zorder=5)
+            ax.xaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=5))
+
+        # Inset colorbars (upper right) with white background
+        for cb_label, im, ax in _cb_data:
+            bg = FancyBboxPatch((0.6, 0.81), 0.36, 0.16,
+                                boxstyle="square,pad=0.01",
+                                transform=ax.transAxes,
+                                facecolor="white", edgecolor="lightgray", linewidth=0.5,
+                                zorder=4, clip_on=False)
+            ax.add_patch(bg)
+            cax = ax.inset_axes([0.62, 0.91, 0.32, 0.04])
+            cax.set_zorder(5)
+            cbar = plt.colorbar(im, cax=cax, orientation="horizontal")
+            cbar.set_label(cb_label, fontsize=9., labelpad=2)
+            cax.tick_params(labelsize=7)
 
 
         ####    RETURN FIG, AXS    ####

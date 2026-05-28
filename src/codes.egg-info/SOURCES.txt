@@ -9,6 +9,7 @@ src/codes/Okada3DForwardModel.py
 src/codes/OpticalData.py
 src/codes/Patch.py
 src/codes/Profile.py
+src/codes/Styles.py
 src/codes/TwoDDzForwardModel.py
 src/codes/TwoDHomogeneousForwardModel.py
 src/codes/__init__.py

@@ -5,6 +5,7 @@ Summary: Utility classes and methods that I use across projects in my PhD, on us
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 Requires-Dist: arviz>=0.16.0
+Requires-Dist: cmcrameri>=1.9
 Requires-Dist: geopandas>=1.0.1
 Requires-Dist: matplotlib>=3.9.4
 Requires-Dist: numba>=0.60.0
