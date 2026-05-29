@@ -136,59 +136,61 @@ class OpticalData:
         return _self
 
     ## Method to evaluate displacement along a given profile
-    def evaluate_profile(self, profile, n_eval_pts=400):
+    def evaluate_profile(self, profile, swathe_half_width=500.):
 
         '''
-        Evaluate displacement along a profile given a profile geometry. Rotates EW and NS into profile-parallel
-        and profile-perpendicular components.
+        Evaluate displacement within a swathe around a profile line. All raster pixels
+        within swathe_half_width of the line are projected onto it with no interpolation
+        or smoothing. Rotates EW and NS into profile-parallel and profile-perpendicular
+        components.
 
         Args:
-            profile (Profile): profile class with geometry defined (i.e. profile.trace is not None)
-            n_eval_pts (int): the number of evenly-spaced points to evaluate along the profile
+            profile (Profile): profile with geometry defined (profile.trace is not None)
+            swathe_half_width (float): half-width of the swathe in raster CRS units
         '''
-        lines = profile.trace.geometry.values
-        displacements = np.zeros((2,n_eval_pts,len(lines)))
-        for i, line in enumerate(lines):
-            (x0, y0), (x1, y1) = line.coords[:2]
+        (x0, y0), (x1, y1) = profile.linestring.coords[:2]
+        L = np.hypot(x1 - x0, y1 - y0)
+        ux, uy = (x1 - x0) / L, (y1 - y0) / L  # unit along-profile vector
 
-            xs = np.linspace(x0, x1, n_eval_pts)
-            ys = np.linspace(y0, y1, n_eval_pts)
+        # Build pixel coordinate grid
+        XX, YY = np.meshgrid(self.ew.x.values, self.ew.y.values)
+        dx, dy = XX - x0, YY - y0
 
-            xs_along_profile = np.hypot(xs - x0, ys - y0)
+        # Projection of each pixel onto and perpendicular to the profile
+        along = dx * ux + dy * uy
+        perp  = dx * (-uy) + dy * ux
 
-            theta = np.arctan2(y1-y0, x1-x0)
+        # Rotate EW/NS into profile-parallel and profile-perpendicular components
+        theta = np.arctan2(y1 - y0, x1 - x0)
+        ew_vals = self.ew.values
+        ns_vals = self.ns.values
+        parallel_vals = ew_vals * np.cos(theta) + ns_vals * np.sin(theta)
+        perp_vals     = -ew_vals * np.sin(theta) + ns_vals * np.cos(theta)
 
-            parallel = self.ew * np.cos(theta) + self.ns * np.sin(theta)
-            perp = -self.ew * np.sin(theta) + self.ns * np.cos(theta)
+        # Swathe mask: within half-width, within profile extent, not NaN
+        mask = (
+            (np.abs(perp) <= swathe_half_width) &
+            (along >= 0) & (along <= L) &
+            ~np.isnan(ew_vals) & ~np.isnan(ns_vals)
+        )
 
-            # Interpolate along profile
-            parallel_vals = parallel.interp(
-                x=("points", xs),
-                y=("points", ys)
-            ).values
-            perp_vals = perp.interp(
-                x=("points", xs),
-                y=("points", ys)
-            ).values
-
-            # Pack up into np array
-            displacements[:, :, i] = np.array([parallel_vals, perp_vals])
-
-        # Alter profile object
-        profile.displacements = np.mean(displacements, axis=2)
-        profile.xs = xs_along_profile - profile.fault_x
+        along_pts    = along[mask]
+        sort_idx     = np.argsort(along_pts)
+        profile.xs            = along_pts[sort_idx] - profile.fault_x
+        profile.displacements = np.array([parallel_vals[mask][sort_idx],
+                                          perp_vals[mask][sort_idx]])
 
         return profile
 
-    
 
     ## Helper method to evaluate multiple profiles in one go
-    def evaluate_profiles(self, profiles):
-        return [self.evaluate_profile(p) for p in profiles]
+    def evaluate_profiles(self, profiles, **kwargs):
+        return [self.evaluate_profile(p, **kwargs) for p in profiles]
 
 
     ## Helper method to easily plot the optical data using Matplotlib. Provide axes or they will be generated.
-    def plot(self, ew=True, ns=True, title=None, fault=None, profiles=None, cmap=cmc.vik, xlim=None, ylim=None):
+    def plot(self, ew=True, ns=True, title=None, fault=None, profiles=None,
+             profile_swathe_width=None, cmap=cmc.vik, xlim=None, ylim=None):
 
         '''
         Plots a nice looking map of optical data. Will plot on provided axes if given, else will produce and return a figure.
@@ -197,6 +199,9 @@ class OpticalData:
             ew (bool or Mpl axes): does not plot EW displacement if false, creates axes and plots if True, plots on provided axes if given.
             ns (bool or Mpl axes): does not plot NS displacement if false, creates axes and plots if True, plots on provided axes if given.
             title (str): Figure title
+            profile_swathe_width (float or None): if given, each profile is drawn as a thin
+                centre line plus a translucent swathe of this full width in metres (buffered
+                in the profile's UTM CRS before reprojection to EPSG:4326).
         '''
         from matplotlib.patches import FancyBboxPatch
 
@@ -207,7 +212,7 @@ class OpticalData:
         n_axs = sum((bool(ew), bool(ns)))   # count number of axes to plot
 
         if ew==True or ns==True:   # create figure if not supplied with axes
-            fig = plt.figure(figsize=(1.5+4.5*n_axs, 5), layout="constrained")
+            fig = plt.figure(figsize=(1.5+5.*n_axs, 5), layout="constrained")
             if title is not None: fig.suptitle(title)
 
         if isinstance(ew, mpl.axes.Axes):    # if supplied EW axis to plot, save reference
@@ -256,8 +261,11 @@ class OpticalData:
                 fault.trace.plot(ax=ax, color="black", linewidth=2.)
             if profiles is not None:
                 for p in profiles:
-                    p = p.trace_to_crs("EPSG:4326")
-                    p.trace.plot(ax=ax, color="deeppink", linewidth=1.5)
+                    if profile_swathe_width is not None:
+                        buf = p.trace.copy()
+                        buf["geometry"] = buf.geometry.buffer(profile_swathe_width / 2.)
+                        buf.to_crs("EPSG:4326").plot(ax=ax, color="deeppink", alpha=0.25, linewidth=0)
+                    p.trace.to_crs("EPSG:4326").plot(ax=ax, color="deeppink", linewidth=1.)
 
             # Scale bar (lower left), auto-sized to ~20% of plot width
             x_min, x_max = ax.get_xlim()

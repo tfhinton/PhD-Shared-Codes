@@ -63,41 +63,25 @@ class Fault:
     
 
     ## Method to generate programatically profile lines perpendicular to the fault trace
-    def gen_profiles(self, n_profiles=10, half_length=5000., n_in_swathe=10, swathe_separation=5.):
+    def gen_profiles(self, n_profiles=10, half_length=5000.):
         '''
-        Generate multiple profile lines perpendicular to a fault trace, spaced evenly along the fault (includes the start and end of fault).
+        Generate profile lines perpendicular to a fault trace, spaced evenly along the fault (includes the start and end of fault).
 
         Kwargs:
             n_profiles (int): the number of profiles to generate
             half_length (float): the length of the profile on either side of the fault in metres
-        
-        Returns:
-            geolines (list of geopandas GeoDataFrame): one data frame per profile
-        '''
 
-        # Choose where to sample along fault trace
+        Returns:
+            list of Profile: one Profile per sample position along the fault trace
+        '''
         x_len = self.trace.length[0]
-        xs = np.linspace(0, x_len, n_profiles)
         profiles = []
 
-        # For each sampling point
-        for x in xs:
-            halfwidth = (n_in_swathe*swathe_separation)/2
-            start = max(x-halfwidth, 0)
-            end = min(start+2*halfwidth, x_len)
+        for x in np.linspace(0, x_len, n_profiles):
+            line = profile_geom(self.trace, x, half_length)
+            geolines = gpd.GeoDataFrame({"x_along_fault_trace": [x]}, geometry=[line], crs=self.trace.crs)
+            profiles.append(Profile(trace=geolines, fault_x=half_length))
 
-            geometries = []
-            dists = []
-            for n in np.linspace(start, end, n_in_swathe):
-                line = profile_geom(self.trace, n, half_length)
-                geometries.append(line)
-                dists.append(n)
-            
-            # Pack up into GeoDataFrame
-            geolines = gpd.GeoDataFrame({"x_along_fault_trace": dists}, geometry=geometries, crs=self.trace.crs)
-            profile = Profile(trace=geolines, fault_x=half_length)
-            profiles.append(profile)
-        
         return profiles
 
 
