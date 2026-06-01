@@ -73,7 +73,8 @@ class TwoDDzForwardModel:
     def pred_func(self, p):
         _self = self._copy()
         _self.dz_half_width = p[0]
-        _self.slips = p[1:]
+        _self.modulus_ratio = p[1]
+        _self.slips[:(len(p)-2)] = p[2:]
         _self = _self.run(_self.xs)
         sol = _self.sol
         return sol
@@ -85,7 +86,8 @@ class TwoDDzForwardModel:
 
         maps = get_medians_from_arviz(result)
         _self.dz_half_width = maps[0]
-        _self.slips = maps[1:]
+        _self.modulus_ratio = maps[1]
+        _self.slips = maps[2:]
         _self = _self.run(_self.xs)
 
         fig, axs = _self.plot(title=title, true_slips=true_slips, **plot_kwargs)

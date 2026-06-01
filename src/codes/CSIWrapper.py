@@ -109,10 +109,17 @@ class CSIWrapper:
             depth_top = min(p0[2], p1[2])
             depth_bot = max(p0[2], p1[2])
 
+            intersection = np.array([p0, p1])
+            if intersection[0][2] > intersection[1][2]:
+                intersection[[0, 1]] = intersection[[1, 0]]  # swap to ensure top is first
+            # intersection = np.sort(intersection, axis=2)  # sort by depth (z)
+
             results.append({
                 'patch_idx': i,
                 'patch': patch,
-                'intersection': np.array([p0, p1]),
+                'intersection': intersection,
+                'intersection_top': intersection[0][2],
+                'intersection_bot': intersection[1][2],
                 'depth_top': depth_top,
                 'depth_bot': depth_bot,
             })

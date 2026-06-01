@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 import copy
 
 class Profile:
@@ -45,6 +46,69 @@ class Profile:
         _self.trace = _self.trace.to_crs(target_crs)
         return _self
     
+
+    ## Method to bin-average profile data along the x-axis
+    def bin_average(self, n_bins=50, n_near_fault_bins=None, near_fault_dist=None):
+        '''
+        Split profile data into bins along the x-axis and return a copy with each bin
+        replaced by its mean. Empty bins are NaN.
+
+        If n_near_fault_bins and near_fault_dist are both given, the profile is divided
+        into three zones:
+            left far-field  : [x_min, -near_fault_dist]
+            near-fault      : [-near_fault_dist, +near_fault_dist]  →  n_near_fault_bins bins
+            right far-field : [+near_fault_dist,  x_max]
+        The remaining (n_bins - n_near_fault_bins) far-field bins are distributed
+        proportionally between left and right based on their data range.
+
+        Kwargs:
+            n_bins (int): total number of bins
+            n_near_fault_bins (int): number of bins in the near-fault zone (requires near_fault_dist)
+            near_fault_dist (float): half-width of the near-fault zone in the same units as xs
+
+        Returns:
+            Profile: copy with xs set to bin centres and displacements set to bin means
+        '''
+        _self = self._copy()
+        xs = self.xs
+        x_min, x_max = xs.min(), xs.max()
+
+        if n_near_fault_bins is not None and near_fault_dist is not None:
+            n_far = n_bins - n_near_fault_bins
+            left_range  = max(-near_fault_dist - x_min, 0.)
+            right_range = max(x_max - near_fault_dist, 0.)
+            total_far   = left_range + right_range
+
+            n_left  = round(n_far * left_range / total_far) if total_far > 0 else n_far // 2
+            n_right = n_far - n_left
+
+            parts = []
+            if n_left > 0:
+                parts.append(np.linspace(x_min, -near_fault_dist, n_left + 1))
+            parts.append(np.linspace(-near_fault_dist, near_fault_dist, n_near_fault_bins + 1))
+            if n_right > 0:
+                parts.append(np.linspace(near_fault_dist, x_max, n_right + 1))
+
+            edges = parts[0]
+            for part in parts[1:]:
+                edges = np.concatenate([edges, part[1:]])
+        else:
+            edges = np.linspace(x_min, x_max, n_bins + 1)
+
+        n_total = len(edges) - 1
+        centres = (edges[:-1] + edges[1:]) / 2.
+        bin_idx = np.clip(np.digitize(xs, edges, right=False) - 1, 0, n_total - 1)
+
+        binned = np.full((self.displacements.shape[0], n_total), np.nan)
+        for i in range(n_total):
+            mask = bin_idx == i
+            if mask.any():
+                binned[:, i] = np.nanmean(self.displacements[:, mask], axis=1)
+
+        _self.xs = centres
+        _self.displacements = binned
+        return _self
+
 
     ## Helper method to easily plot the optical data using Matplotlib. Provide axes or they will be generated.
     def plot(self, ax=None, parallel=True, perpendicular=True, title=None):

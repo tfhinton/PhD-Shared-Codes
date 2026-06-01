@@ -47,8 +47,6 @@ class HamiltonianInversion:
         _self._print("Starting inversion...")
 
 
-        cd_inv = np.linalg.inv(_self.Cd)
-
         # Wrap pred_func as a PyTensor/Theano op so PyMC can differentiate through it.
         # For NUTS (gradient-based), we use a black-box op with finite-difference gradients.
         from pytensor.graph.op import Op
@@ -96,10 +94,8 @@ class HamiltonianInversion:
             # Forward model prediction
             pred = forward_op(params_vec)
 
-            # Log-likelihood: -0.5 * (d - pred)^T Cd^{-1} (d - pred)
-            residual = _self.data - pred
-            log_like = -0.5 * pt.dot(residual, pt.dot(cd_inv, residual))
-            pm.Potential("obs", log_like)
+            # Log-likelihood: multivariate Gaussian with full covariance matrix
+            pm.MvNormal("obs", mu=pred, cov=_self.Cd, observed=_self.data)
 
             # Sample with NUTS (the HMC variant PyMC uses by default)
             result = pm.sample(
@@ -125,41 +121,41 @@ class HamiltonianInversion:
         if var_names is None:
             var_names = self.prior_labels[:5]
         
-        axs = az.plot_trace(self.result, var_names=var_names)
-        fig = axs.flatten()[0].get_figure()
-        fig.suptitle(title)
+        axs = az.plot_trace_dist(self.result, var_names=var_names)
+        # fig = np.atleast_2d(axs).flatten()[0].get_figure()
+        # fig.suptitle(title)
 
-        return fig, axs
+        # return fig, axs
     
 
     def plot_posterior(self, var_names=None, title="Posterior distributions of inverted model parameters"):
         if var_names is None:
             var_names = self.prior_labels[:5]
         
-        axs = az.plot_posterior(self.result, var_names=var_names)
-        fig = axs.flatten()[0].get_figure()
-        fig.suptitle(title)
+        axs = az.plot_dist(self.result, var_names=var_names)
+        # fig = np.atleast_2d(axs).flatten()[0].get_figure()
+        # fig.suptitle(title)
 
-        return fig, axs
+        # return fig, axs
     
 
     def plot_tradeoffs(self, var_names=None, title="Covariance between inverted model parameters"):
         if var_names is None:
             var_names = self.prior_labels[:5]
 
-        axs = az.plot_pair(self.result, var_names=var_names, kind="kde")
-        fig = np.atleast_2d(axs).flatten()[0].get_figure()
-        fig.suptitle(title)
+        axs = az.plot_pair(self.result, var_names=var_names)
+        # fig = np.atleast_2d(axs).flatten()[0].get_figure()
+        # fig.suptitle(title)
 
-        return fig, axs
+        # return fig, axs
     
 
     def plot_ppc(self, title="Compare posterior distribution to observed data distribution"):
-        ax = az.plot_ppc(self.ppc, data_pairs={"obs": "obs"})
-        fig = ax.get_figure()
-        fig.suptitle(title)
+        ax = az.plot_ppc_dist(self.ppc)
+        # fig = ax.get_figure()
+        # fig.suptitle(title)
 
-        return fig, ax
+        # return fig, ax
     
 
     def diagnostics(self, var_names=None):
