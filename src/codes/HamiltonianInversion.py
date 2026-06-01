@@ -2,6 +2,7 @@ import pymc as pm
 import arviz as az
 import numpy as np
 import copy
+import time
 from .utils import get_maps_from_arviz
 
 class HamiltonianInversion:
@@ -42,7 +43,7 @@ class HamiltonianInversion:
     def _print(self, *args, **kwargs):
         if self.verbose: print(*args, **kwargs)
     
-    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4):
+    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, timeout_minutes=30):
         _self = self._copy()
         _self._print("Starting inversion...")
 
@@ -84,6 +85,14 @@ class HamiltonianInversion:
 
         forward_op = ForwardOp()
 
+        _start_time = time.time()
+
+        def _timeout_callback(_trace, _draw):
+            if timeout_minutes is not None:
+                if time.time() - _start_time > timeout_minutes * 60:
+                    _self._print(f"\nTimeout of {timeout_minutes} minutes reached — stopping sampling early.")
+                    raise KeyboardInterrupt
+
         with pm.Model() as model:
             # Build priors from UniformDist objects
             param_vars = [p.pm for p in _self.priors]
@@ -105,6 +114,7 @@ class HamiltonianInversion:
                 chains=chains,
                 return_inferencedata=True,
                 progressbar=True,
+                callback=_timeout_callback,
             )
         
         # posterior predictive (linearized)
@@ -133,6 +143,7 @@ class HamiltonianInversion:
             var_names = self.prior_labels[:5]
         
         axs = az.plot_dist(self.result, var_names=var_names)
+        return axs
         # fig = np.atleast_2d(axs).flatten()[0].get_figure()
         # fig.suptitle(title)
 
