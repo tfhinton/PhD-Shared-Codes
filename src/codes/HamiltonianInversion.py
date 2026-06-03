@@ -87,7 +87,7 @@ class HamiltonianInversion:
 
         _start_time = time.time()
 
-        def _timeout_callback(_trace, _draw):
+        def _timeout_callback(*args, **kwargs):
             if timeout_minutes is not None:
                 if time.time() - _start_time > timeout_minutes * 60:
                     _self._print(f"\nTimeout of {timeout_minutes} minutes reached — stopping sampling early.")
@@ -139,10 +139,7 @@ class HamiltonianInversion:
     
 
     def plot_posterior(self, var_names=None, title="Posterior distributions of inverted model parameters"):
-        if var_names is None:
-            var_names = self.prior_labels[:5]
-        
-        axs = az.plot_dist(self.result, var_names=var_names)
+        axs = az.plot_dist(self.result)
         return axs
         # fig = np.atleast_2d(axs).flatten()[0].get_figure()
         # fig.suptitle(title)
