@@ -12,5 +12,7 @@ from .AltarOutput import AltarOutput
 from .CSIWrapper import CSIWrapper
 from . import utils
 from . import Styles
+from .Fault3d import Fault3d, Patch, compute_okada
+from .InSAR import InSAR
 
-__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles"]
+__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "Fault3d", "Patch", "compute_okada", "InSAR"]
