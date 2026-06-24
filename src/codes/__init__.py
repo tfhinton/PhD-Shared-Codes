@@ -14,5 +14,6 @@ from . import utils
 from . import Styles
 from .Fault3d import Fault3d, Patch, compute_okada
 from .InSAR import InSAR
+from .GNSS import GNSS
 
-__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "Fault3d", "Patch", "compute_okada", "InSAR"]
+__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "Fault3d", "Patch", "compute_okada", "InSAR", "GNSS"]
