@@ -6,7 +6,10 @@ src/codes/AltarOutput.py
 src/codes/CSIWrapper.py
 src/codes/Dist.py
 src/codes/Fault.py
+src/codes/Fault3d.py
+src/codes/GNSS.py
 src/codes/HamiltonianInversion.py
+src/codes/InSAR.py
 src/codes/InversionManager.py
 src/codes/LeastSquaresInversion.py
 src/codes/Okada3DForwardModel.py
@@ -17,6 +20,7 @@ src/codes/Styles.py
 src/codes/TwoDDzForwardModel.py
 src/codes/TwoDHomogeneousForwardModel.py
 src/codes/__init__.py
+src/codes/fault_profile8.py
 src/codes/meade07.py
 src/codes/styles.mplstyle
 src/codes/thinstyles.mplstyle

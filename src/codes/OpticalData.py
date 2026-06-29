@@ -4,12 +4,37 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import copy
+import warnings
+import functools
 import cmcrameri.cm as cmc
 import pyproj
+import geopandas as gpd
 import scipy.optimize as sp_opt
 import scipy.spatial.distance as sp_dist
-from shapely.geometry import Point
-from shapely.ops import unary_union
+from shapely.geometry import Point, LineString
+from shapely.ops import unary_union, linemerge
+from scipy.ndimage import map_coordinates, gaussian_filter1d
+from scipy.interpolate import interp1d, UnivariateSpline
+from sklearn.linear_model import RANSACRegressor, LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import r2_score
+from .Profile import Profile
+from ._fault_profile_helpers import (
+    smoothed_boxcar, replace_outliers_robust, remove_marginal_outliers,
+    finite_strain,
+)
+
+
+def _quiet_runtimewarnings(fn):
+    '''Suppress the expected NaN-reduction RuntimeWarnings raised by the
+    strain/stacking pipeline (empty-slice means, all-NaN max, divide-by-zero).'''
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with warnings.catch_warnings(), np.errstate(invalid='ignore', divide='ignore'):
+            warnings.simplefilter('ignore', RuntimeWarning)
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 ###   OpticalData class
@@ -421,6 +446,585 @@ class OpticalData:
     ## Helper method to evaluate multiple profiles in one go
     def evaluate_profiles(self, profiles, **kwargs):
         return [self.evaluate_profile(p, **kwargs) for p in profiles]
+
+
+    ## Strain-aligned, along-strike-stacked fault-perpendicular profiling
+    @_quiet_runtimewarnings
+    def evaluate_profiles_fault_aligned(
+            self, fault,
+            plen=500, stack=300, trace_smooth=15,
+            shift_cap=8, shift_cap_final=4,
+            background_limit=(-750., 750.),
+            near_field_limit=(10., 60.),
+            far_field_limit=None,
+            stdthr=3., attach_to_fault=True, store=True):
+        '''
+        Build fault-perpendicular displacement profiles that follow the *true*
+        fault trace (located from peak shear strain) rather than a hand-drawn
+        approximation. This is a serial port of `fault_profile8.py` adapted to
+        operate directly on this object's rasters and a `Fault` trace.
+
+        Pipeline (all distances internally in pixels; converted to metres on output):
+          1. Resample the fault trace (cubic spline) to ~1 point per pixel and smooth it.
+          2. Compute the local strike at every trace point.
+          3. Sample a fault-perpendicular profile (half-length ``plen`` px) at each point,
+             extracting both finite-strain (shear/dilatation/maxShear) and EW/NS
+             displacement rotated into fault-parallel / fault-normal components.
+          4. Sub-pixel shift each profile so the peak shear strain lands at x=0.
+          5. Median-stack each profile over its +/-``stack`` along-strike neighbours.
+          6. A second, finer global re-shift of the stacked profiles.
+          7. Per-profile analysis: background-strain detrend, fault-zone width, and
+             near/far-field offset estimation by robust regression.
+
+        The NS component is internally flipped to south-positive to reproduce the
+        sign convention of the original script (results are converted back to
+        north-positive fault-normal on output).
+
+        Args:
+            fault (Fault): fault whose ``.trace`` GeoDataFrame (in the same CRS as
+                the optical rasters) provides the rupture trace.
+
+        Kwargs:
+            plen (int): fault-perpendicular profile half-length, in pixels.
+            stack (int): along-strike half-window (in profiles/pixels) for stacking.
+            trace_smooth (int): boxcar width (px) for smoothing the rasterised trace.
+            shift_cap (float): max |shift| (px) allowed in the first relocation.
+            shift_cap_final (float): max |shift| (px) allowed in the second relocation.
+            background_limit (tuple): (left, right) px bounds of the far-field region
+                used to detrend the background strain.
+            near_field_limit (tuple): (inner, outer) px window for the near-field
+                offset regression (relative to the fault-zone edge).
+            far_field_limit (tuple or None): (inner, outer) px window for the
+                far-field offset regression. Defaults to
+                (near_field_limit[1], near_field_limit[1] + 50).
+            stdthr (float): threshold (in std-devs of detrended background strain)
+                for detecting the fault-zone edge.
+            attach_to_fault (bool): if True, set ``fault.refined_trace`` to a
+                GeoDataFrame of the strain-relocated fault trace.
+            store (bool): if True, store the returned profiles on
+                ``self.refined_profiles`` and the per-profile metadata table on
+                ``self.refined_profile_table``.
+
+        Returns:
+            list of Profile: one stacked, fault-aligned Profile per along-strike
+            sample, with ``xs`` (m), ``displacements`` ([parallel, normal], m) and
+            metadata attributes (fault-zone width, offsets, peak strain, etc.).
+        '''
+
+        if far_field_limit is None:
+            far_field_limit = (near_field_limit[1], near_field_limit[1] + 50.)
+        background_limit = list(background_limit)
+        near_field_limit = list(near_field_limit)
+        far_field_limit = list(far_field_limit)
+
+        # ----- raster arrays + affine transform -----
+        transform = self.ew.rio.transform()
+        xres = abs(transform.a)
+        yres = xres
+        crs = self.ew.rio.crs
+
+        disp_ew_fill = self.ew.values.astype(float)
+        disp_ns_fill = -self.ns.values.astype(float)   # south-positive (script convention)
+        H, W = disp_ew_fill.shape
+
+        # ----- 1. rasterise + smooth the fault trace into pixel coordinates -----
+        x, y, angle, x0, y0 = self._rasterise_and_strike(fault, transform, xres, trace_smooth)
+        n_prof = x0.shape[0]
+        self._print(f"Fault trace rasterised to {n_prof} profile positions")
+        if n_prof <= 2 * stack + 2:
+            raise ValueError(
+                f"Trace too short ({n_prof} px) for stack half-width {stack}.")
+
+        # ----- profile end points (perpendicular lines) -----
+        theta_perp = np.deg2rad(angle + 90.)
+        dxp = plen * np.sin(theta_perp)
+        dyp = plen * np.cos(theta_perp)
+        x1 = x0 + dxp; y1 = y0 - dyp
+        x2 = x0 - dxp; y2 = y0 + dyp
+
+        M = 2 * plen + 1
+        prof_dist_pxls = np.linspace(-plen, plen, num=M)
+
+        # ----- 2/3. extract strain and displacement profiles -----
+        # prof_store_strain rows: 0 shear, 1 dilatation, 2 maxShear, 3 unused
+        # prof_store_disp   rows: 0 EW, 1 NS(S+), 2 fault-normal, 3 fault-parallel
+        prof_store_strain = np.full((n_prof, 4, M), np.nan)
+        prof_store_disp = np.full((n_prof, 4, M), np.nan)
+
+        for i in range(n_prof):
+            if self.verbose and (i % 200 == 0):
+                self._print(f"  extracting profile {i} of {n_prof}")
+            window, tmp_prof = self._profile_window(
+                (x1[i], y1[i]), (x2[i], y2[i]), M, disp_ew_fill, disp_ns_fill, H, W)
+            if window is None:
+                continue
+            (ew_win, ns_win) = window
+
+            # strain
+            try:
+                strain_out = finite_strain(ew_win.copy(), ns_win.copy(), xres, yres,
+                                           angle[i], k=1,
+                                           component=['exy', 'dilatation', 'maxShear'])
+                s_shear = np.abs(strain_out[:, :, 0])
+                s_dil = strain_out[:, :, 1]
+                s_maxsh = strain_out[:, :, 2]
+                s_shear = remove_marginal_outliers(s_shear, plen, 15, 0.5)
+                s_dil = remove_marginal_outliers(s_dil, plen, 15, 0.5)
+                prof_store_strain[i, 0, :] = map_coordinates(s_shear, tmp_prof, order=1)
+                prof_store_strain[i, 1, :] = map_coordinates(s_dil, tmp_prof, order=1)
+                prof_store_strain[i, 2, :] = map_coordinates(s_maxsh, tmp_prof, order=1)
+            except Exception:
+                pass
+
+            # displacement (rotate EW/N into fault-parallel / fault-normal)
+            ew_n = ew_win                  # east-positive
+            ns_n = -ns_win                 # north-positive
+            theta = np.radians(90. - angle[i])
+            par = ew_n * np.cos(theta) + ns_n * np.sin(theta)
+            nrm = -ew_n * np.sin(theta) + ns_n * np.cos(theta)
+            prof_store_disp[i, 0, :] = map_coordinates(ew_n, tmp_prof, order=1)
+            prof_store_disp[i, 1, :] = map_coordinates(ns_n, tmp_prof, order=1)
+            prof_store_disp[i, 2, :] = map_coordinates(nrm, tmp_prof, order=1)
+            prof_store_disp[i, 3, :] = map_coordinates(par, tmp_prof, order=1)
+
+        # ----- 4. first relocation: shift each profile onto peak shear strain -----
+        w_shift = smoothed_boxcar(plen, 25, 1)
+        store_shifts = np.zeros(n_prof)
+        for i in range(n_prof):
+            store_shifts[i] = self._locate_peak_shift(
+                prof_store_strain[i, 0, :], w_shift, plen, shift_cap)
+
+        # interpolate failed (zero) shifts from neighbours
+        store_shifts = self._interp_failed_shifts(store_shifts)
+        # apply shifts: strain rows 0,1,2 and disp rows 0,1,2,3
+        tmpx = np.arange(M, dtype=float)
+        self._apply_shift(prof_store_strain, store_shifts, tmpx, rows=(0, 1, 2))
+        store_shifts_disp = replace_outliers_robust(store_shifts, window=10, threshold=1.0)
+        self._apply_shift(prof_store_disp, store_shifts_disp, tmpx, rows=(0, 1, 2, 3))
+
+        # ----- 5. along-strike median stacking -----
+        # strain stats rows: 0 med shear,1 std,2 med dil,3 std,4 med maxShear,5 std
+        # disp   stats rows: 0 med EW,1 std,2 med NS,3 std,4 med normal,5 std,6 med par,7 std
+        strain_stats = self._stack(prof_store_strain, stack, plen, gate_row=1,
+                                   med_rows=(0, 1, 2), out_rows=(0, 2, 4))
+        disp_stats = self._stack(prof_store_disp, stack, plen, gate_row=1,
+                                 med_rows=(0, 1, 2, 3), out_rows=(0, 2, 4, 6))
+        sl = slice(stack, n_prof - stack)
+        strain_stats = strain_stats[sl]
+        disp_stats = disp_stats[sl]
+        n_stack = strain_stats.shape[0]
+        self._print(f"Stacked into {n_stack} profiles")
+
+        # ----- 6. second (finer) global re-shift of stacked profiles -----
+        store_shifts2 = self._second_reshift(strain_stats, disp_stats, prof_dist_pxls,
+                                             plen, stack, shift_cap_final)
+
+        # ----- 7. per-profile analysis (detrend / FZW / offsets) -----
+        profiles = []
+        table = np.full((n_stack, 42), np.nan)
+        # along-fault distance (m) at each stacked profile centre
+        seg = np.hypot(np.diff(x0), np.diff(y0)) * xres
+        along_fault = np.concatenate([[0.], np.cumsum(seg)])
+
+        total_shift = store_shifts[sl] + store_shifts2   # px, drawn-trace -> true fault
+        for ff in range(n_stack):
+            j = ff + stack   # index into full-length trace arrays
+            result, shifted = self._analyse_profile(
+                ff, strain_stats, disp_stats, prof_dist_pxls, plen, xres,
+                background_limit, near_field_limit, far_field_limit, stdthr)
+            table[ff, :len(result)] = result
+
+            # build Profile (geometry in raster CRS, displacements in metres)
+            ux0, uy0 = transform * (x0[j], y0[j])
+            table[ff, 0:5] = [x0[j], y0[j], angle[j], ux0, uy0]
+            ux1, uy1 = transform * (x1[j], y1[j])
+            ux2, uy2 = transform * (x2[j], y2[j])
+            line = LineString([(ux1, uy1), (ux2, uy2)])
+            gdf = gpd.GeoDataFrame({"x_along_fault": [along_fault[j]]},
+                                   geometry=[line], crs=crs)
+            p = Profile(trace=gdf, fault_x=plen * xres)
+            p.xs = prof_dist_pxls * xres
+            # parallel = disp_stats row 6, fault-normal flipped back to N-positive sign
+            p.displacements = np.array([disp_stats[ff, 6, :], disp_stats[ff, 4, :]])
+
+            # metadata
+            p.x_along_fault = along_fault[j]
+            p.strike = angle[j]
+            p.fault_utm = transform * (x0[j], y0[j])
+            p.strain_shear = shifted[0, :]
+            p.strain_dilatation = shifted[1, :]
+            p.fzw = result[24]
+            p.fzw_dilatation = result[28]
+            p.x_min = result[25]; p.x_max = result[26]
+            p.offset_near = result[5]; p.offset_near_std = result[6]
+            p.offset_far = result[11]; p.offset_far_std = result[12]
+            p.offset_near_dil = result[17]; p.offset_near_dil_std = result[18]
+            p.peak_shear = result[32]
+            profiles.append(p)
+
+        # ----- refined trace (drawn trace shifted perpendicular onto peak strain) -----
+        refined_col = x0[sl] - total_shift * np.sin(theta_perp[sl])
+        refined_row = y0[sl] + total_shift * np.cos(theta_perp[sl])
+        rx, ry = transform * (refined_col, refined_row)
+        refined_trace = gpd.GeoDataFrame(
+            {"id": [0]}, geometry=[LineString(np.column_stack([rx, ry]))], crs=crs)
+        if attach_to_fault:
+            fault.refined_trace = refined_trace
+
+        if store:
+            self.refined_profiles = profiles
+            self.refined_profile_table = table
+            self.refined_trace = refined_trace
+
+        return profiles
+
+
+    # ---- helpers for evaluate_profiles_fault_aligned ----
+
+    def _rasterise_and_strike(self, fault, transform, xres, trace_smooth):
+        '''Resample fault trace to ~1pt/px in pixel coords, smooth, return
+        (x, y, angle, x0, y0) where x/y are smoothed trace pixel coords, angle is
+        the local strike (bearing from N, deg) and x0/y0 the strike-defining points.'''
+        # gather UTM vertices (single continuous trace expected)
+        merged = unary_union(fault.trace.geometry.values)
+        if merged.geom_type == 'MultiLineString':
+            merged = linemerge(merged)
+        if merged.geom_type == 'MultiLineString':
+            merged = max(merged.geoms, key=lambda g: g.length)
+            self._print("  warning: trace was multi-part; using longest segment")
+        verts = np.asarray(merged.coords)
+
+        d = np.concatenate([[0.], np.cumsum(np.hypot(np.diff(verts[:, 0]),
+                                                     np.diff(verts[:, 1])))])
+        uniq = np.unique(d, return_index=True)[1]
+        d, verts = d[uniq], verts[uniq]
+        fx = interp1d(d, verts[:, 0], kind='cubic')
+        fy = interp1d(d, verts[:, 1], kind='cubic')
+        npts = int(d[-1] / xres)
+        dd = np.linspace(0., d[-1], npts + 1)
+        xfine, yfine = fx(dd), fy(dd)
+        col, row = ~transform * (xfine, yfine)   # UTM -> pixel
+        x = np.asarray(col, dtype=float)
+        y = np.asarray(row, dtype=float)
+
+        # smooth pixel trace (drops endpoints, mode='valid')
+        k = np.ones(trace_smooth) / trace_smooth
+        x = np.convolve(x, k, mode='valid')
+        y = np.convolve(y, k, mode='valid')
+
+        # local strike angle (bearing from N), span=1
+        span = 1
+        angle = np.zeros(x.shape)
+        for i in range(span, x.shape[0] - span):
+            x0i = np.mean(x[i - span:i]); x1i = np.mean(x[i:i + span])
+            y0i = np.mean(y[i - span:i]); y1i = np.mean(y[i:i + span])
+            dx, dy = x1i - x0i, y1i - y0i
+            angle[i] = (90. + np.rad2deg(np.arctan2(dy, dx))) % 360.
+        angle = angle[span:-span]
+        x0 = x[span:-span]
+        y0 = y[span:-span]
+        return x, y, angle, x0, y0
+
+    def _profile_window(self, p1, p2, M, ew, ns, H, W, expwd=5):
+        '''Crop a padded raster window around a profile and return
+        ((ew_win, ns_win), tmp_prof) where tmp_prof is the (2, M) [row, col]
+        sample coordinate array in window-local pixels. Returns (None, None) if
+        the window falls (largely) outside the raster.'''
+        prof = np.linspace([p1[0], p1[1]], [p2[0], p2[1]], num=M)   # cols=x, rows=y
+        r0 = int(np.min(prof[:, 1])) - expwd
+        r1 = int(np.max(prof[:, 1])) + expwd
+        c0 = int(np.min(prof[:, 0])) - expwd
+        c1 = int(np.max(prof[:, 0])) + expwd
+        r0c, r1c = max(0, r0), min(H, r1)
+        c0c, c1c = max(0, c0), min(W, c1)
+        if (r1c - r0c) < 3 or (c1c - c0c) < 3:
+            return None, None
+        tmp_prof = np.fliplr(prof).T.copy()   # row 0 = y(row), row 1 = x(col)
+        tmp_prof[0, :] -= r0c
+        tmp_prof[1, :] -= c0c
+        return (ew[r0c:r1c, c0c:c1c], ns[r0c:r1c, c0c:c1c]), tmp_prof
+
+    def _locate_peak_shift(self, shear, w, plen, cap):
+        '''Sub-pixel offset (px) of the peak (weighted) shear strain from centre,
+        clipped to +/-cap. Returns 0 on failure.'''
+        ysp = shear * w
+        xsp = np.linspace(0, ysp.shape[0] - 1, ysp.shape[0])
+        valid = ~np.isnan(ysp)
+        if valid.sum() < 4:
+            return 0.
+        try:
+            spline = UnivariateSpline(xsp[valid], ysp[valid], s=1e-9)
+            xno = int(xsp.shape[0] * 1e3)
+            x_fine = np.linspace(xsp.min(), xsp.max(), xno)
+            y_fine = spline(x_fine)
+            x_shift = (np.nanargmax(y_fine) / xno) * xsp.shape[0] - (xsp.shape[0] / 2.)
+            if (x_shift >= cap) or (x_shift <= -cap):
+                x_shift = 0.
+        except Exception:
+            x_shift = 0.
+        return x_shift
+
+    @staticmethod
+    def _interp_failed_shifts(store_shifts):
+        valid = store_shifts != 0
+        if valid.sum() < 2:
+            return store_shifts
+        rows = np.arange(store_shifts.shape[0])
+        f = interp1d(rows[valid], store_shifts[valid], kind='slinear',
+                     bounds_error=False, fill_value=np.nan)
+        out = f(rows)
+        out[np.isnan(out)] = 0.
+        return out
+
+    @staticmethod
+    def _apply_shift(prof_store, shifts, tmpx, rows):
+        '''Re-interpolate selected channels of prof_store onto a shifted x-axis.'''
+        for i in range(prof_store.shape[0]):
+            tmpx2 = tmpx - shifts[i]
+            for p in rows:
+                col = prof_store[i, p, :]
+                valid = np.isfinite(col) & np.isfinite(tmpx2)
+                if valid.sum() < 2:
+                    prof_store[i, p, :] = np.nan
+                    continue
+                try:
+                    f = interp1d(tmpx2[valid], col[valid], kind='slinear',
+                                 bounds_error=False, fill_value=np.nan)
+                    prof_store[i, p, :] = f(tmpx)
+                except Exception:
+                    prof_store[i, p, :] = np.nan
+
+    @staticmethod
+    def _stack(prof_store, stack, plen, gate_row, med_rows, out_rows):
+        '''Median+std stack each profile over +/-stack along-strike neighbours.
+        med_rows are source channels; out_rows are the median destination rows in
+        the (n, 8, M) output (std goes to out_row+1).'''
+        n, _, M = prof_store.shape
+        stats = np.full((n, 8, M), np.nan)
+        for i in range(stack, n - stack):
+            block_gate = prof_store[i - stack:i + stack, gate_row, :]
+            track_nan = np.sum(np.isnan(block_gate), axis=0)
+            if np.sum(track_nan < stack // 3) >= plen // 1.5:
+                for src, dst in zip(med_rows, out_rows):
+                    block = prof_store[i - stack:i + stack, src, :]
+                    stats[i, dst, :] = np.nanmedian(block, axis=0)
+                    stats[i, dst + 1, :] = np.nanstd(block, axis=0)
+        return stats
+
+    def _second_reshift(self, strain_stats, disp_stats, prof_dist_pxls,
+                        plen, stack, cap):
+        '''Estimate and apply a finer global re-shift of the stacked profiles,
+        aligning on the stacked peak shear. Shifts strain rows 0,2 and disp rows
+        4,6. Returns the (smoothed) shift array (px).'''
+        n = strain_stats.shape[0]
+        w = smoothed_boxcar(plen, 8, 1)
+        shifts2 = np.zeros(n)
+        for ff in range(n):
+            ysp = strain_stats[ff, 0, :]
+            valid = ~np.isnan(ysp)
+            if valid.sum() < 4:
+                continue
+            try:
+                spline = UnivariateSpline(prof_dist_pxls[valid],
+                                          (ysp * w)[valid], s=1e-9)
+                xno = int(prof_dist_pxls.shape[0] * 1e3)
+                x_fine = np.linspace(prof_dist_pxls.min(), prof_dist_pxls.max(), xno)
+                y_fine = spline(x_fine)
+                xs = (np.nanargmax(y_fine) / xno) * prof_dist_pxls.shape[0] \
+                    - (prof_dist_pxls.shape[0] / 2.)
+                if (xs >= cap) or (xs <= -cap):
+                    xs = 0.
+            except Exception:
+                xs = 0.
+            shifts2[ff] = xs
+
+        valid = shifts2 != 0
+        if valid.sum() == 0:
+            self._print("  second re-shift: no valid shifts, skipping")
+            return np.zeros(n)
+        rows = np.arange(n)
+        f = interp1d(rows[valid], shifts2[valid], kind='slinear',
+                     bounds_error=False, fill_value=np.nan)
+        shifts2 = f(rows)
+        good = ~np.isnan(shifts2)
+        shifts2[~good] = 0.
+        shifts2 = gaussian_filter1d(shifts2, sigma=stack / 0.5)
+
+        # apply: strain rows 0,2 ; disp rows 4,6
+        for ff in range(n):
+            sh = shifts2[ff]
+            for arr, row in ((strain_stats, 0), (strain_stats, 2),
+                             (disp_stats, 4), (disp_stats, 6)):
+                col = arr[ff, row, :]
+                valid = np.isfinite(col)
+                if valid.sum() < 2:
+                    continue
+                try:
+                    g = interp1d(prof_dist_pxls[valid] - sh, col[valid],
+                                 kind='slinear', bounds_error=False, fill_value=np.nan)
+                    out = g(prof_dist_pxls)
+                    out[np.isnan(out)] = 0.
+                    arr[ff, row, :] = out
+                except Exception:
+                    pass
+        return shifts2
+
+    def _analyse_profile(self, ff, strain_stats, disp_stats, prof_dist_pxls,
+                         plen, xres, background_limit, near_field_limit,
+                         far_field_limit, stdthr):
+        '''Per-profile detrend / fault-zone-width / offset analysis. Returns
+        (result_store [len 42], result_shifted [3, M] = shear/dil/parallel).'''
+        M = prof_dist_pxls.shape[0]
+        result = np.full(42, np.nan)
+        shifted = np.zeros((3, M))
+
+        ysp = strain_stats[ff, 0, :].copy()    # shear
+        yspd = strain_stats[ff, 2, :].copy()   # dilatation
+        yspss = disp_stats[ff, 6, :].copy()    # fault-parallel displacement
+        xsp = prof_dist_pxls
+
+        w = smoothed_boxcar(plen, 50, 1)
+        valid = (np.isnan(ysp) + (ysp == 0)) < 1
+        valid2 = (np.isnan(yspd) + (yspd == 0)) < 1
+        valid3 = (np.isnan(yspss) + (yspss == 0)) < 1
+
+        if valid.sum() < ysp.shape[0] * 0.5:
+            return result, shifted
+
+        xsp2 = xsp[valid]
+        yspd2 = yspd[valid2]
+        yspss2 = yspss[valid3]
+
+        threshold = 0.; threshold2 = 0.; r2 = np.nan
+        x_min = np.nan; x_max = np.nan; fzw = np.nan
+        x_min2 = np.nan; x_max2 = np.nan; fzw2 = np.nan
+
+        # --- detrend background shear strain via RANSAC polynomial ---
+        try:
+            bg = (xsp2 <= background_limit[0]) | (xsp2 >= background_limit[1])
+            xx = xsp2[bg].reshape(-1, 1)
+            yy = ysp[valid][bg].reshape(-1, 1)
+            ransac_in = RANSACRegressor(min_samples=0.6,
+                                        residual_threshold=0.2 * np.std(yy),
+                                        max_trials=100, random_state=42)
+            model = make_pipeline(PolynomialFeatures(3), ransac_in)
+            model.fit(xx, yy)
+            inlier = model.named_steps['ransacregressor'].inlier_mask_
+            y_pred = model.predict(xx)
+            r2 = r2_score(yy[inlier], y_pred[inlier])
+            ysp_background = model.predict(xsp.reshape(-1, 1))
+            ysp_detrend = ysp.reshape(-1, 1) - ysp_background
+            std2 = np.nanstd(yy - model.predict(xx))
+            threshold = stdthr * std2
+            threshold2 = threshold
+            ysp = np.squeeze(ysp_detrend)
+        except Exception:
+            self._print(f"  could not detrend strain, row {ff}")
+
+        # spline fits of detrended shear (and dilatation) for FZW edges
+        xno = int(xsp.shape[0] * 1e3)
+        x_fine = np.linspace(xsp.min(), xsp.max(), xno)
+        ysp2 = ysp[valid]
+        try:
+            spline = UnivariateSpline(xsp2, ysp2 * (w[valid]), s=1e-9)
+            y_fine = spline(x_fine)
+        except Exception:
+            y_fine = np.zeros_like(x_fine)
+        try:
+            spline2 = UnivariateSpline(xsp2, yspd2 * (w[valid2]), s=1e-9)
+            y2_fine = spline2(x_fine)
+        except Exception:
+            y2_fine = np.zeros_like(x_fine)
+
+        try:
+            x_shift = (np.nanargmax(y_fine) / xno) * xsp.shape[0] - (xsp.shape[0] / 2.)
+        except Exception:
+            x_shift = 0.
+
+        shifted[0, :] = ysp
+        shifted[1, :] = yspd
+        shifted[2, :] = yspss
+
+        # fault-zone width from detrended shear (threshold crossings each side)
+        x_min, x_max, fzw = self._threshold_width(x_fine, y_fine, threshold)
+        x_min2, x_max2, fzw2 = self._threshold_width(x_fine, y2_fine, threshold2)
+
+        # --- offsets by robust regression of fault-parallel displacement ---
+        offset, std_o, xl, xr = self._regress_offset(
+            xsp2, yspss2, x_min, x_max, near_field_limit, xsp.shape[0])
+        offset2, std_o2, xl2, xr2 = self._regress_offset(
+            xsp2, yspss2, x_min, x_max, far_field_limit, xsp.shape[0])
+        offset3, std_o3, xl3, xr3 = self._regress_offset(
+            xsp2, yspss2, x_min2, x_max2, near_field_limit, xsp.shape[0])
+
+        A_fit = mu_fit = sigma_fit = alpha_fit = b_fit = 0.
+        r_squared = 0.
+        # entries 0-4 (trace coords) are filled by the caller
+        result = np.array([
+            0., 0., 0., 0., 0.,
+            offset, std_o, xl[0], xl[-1], xr[0], xr[-1],
+            offset2, std_o2, xl2[0], xl2[-1], xr2[0], xr2[-1],
+            offset3, std_o3, xl3[0], xl3[-1], xr3[0], xr3[-1],
+            fzw * xres, x_min * xres, x_max * xres, threshold,
+            fzw2 * xres, x_min2 * xres, x_max2 * xres, threshold2,
+            np.nanmax(ysp), np.nanmax(yspd), x_shift, r2,
+            A_fit, mu_fit, sigma_fit, alpha_fit, b_fit, r_squared,
+        ], dtype=float)
+        return result, shifted
+
+    @staticmethod
+    def _threshold_width(x_fine, y_fine, threshold):
+        '''Distance from x=0 to the first threshold down-crossing on each side.'''
+        try:
+            left = np.where(x_fine <= 0)
+            xl = (-x_fine[left])[::-1]; yl = (y_fine[left])[::-1]
+            below = np.where(yl < threshold)[0]
+            x_min = -xl[below[0]]
+        except IndexError:
+            x_min = np.nan
+        try:
+            right = np.where(x_fine >= 0)
+            xr = (x_fine[right]); yr = (y_fine[right])
+            below = np.where(yr < threshold)[0]
+            x_max = xr[below[0]]
+            fzw = x_max - x_min
+        except IndexError:
+            x_max = np.nan; fzw = np.nan
+        return x_min, x_max, fzw
+
+    @staticmethod
+    def _regress_offset(xsp2, yspss2, x_min, x_max, limit, npred):
+        '''Robust (RANSAC) linear fits to fault-parallel displacement in windows
+        just outside the fault zone on each side; offset = right(0) - left(0).'''
+        inner, outer = limit
+        # right
+        try:
+            idx = np.where((xsp2 >= x_max + inner) & (xsp2 <= x_max + outer))
+            x_right = xsp2[idx]; y_right = yspss2[idx]
+            rt = np.std(y_right) * 3
+            ransac = RANSACRegressor(estimator=LinearRegression(), residual_threshold=rt)
+            ransac.fit(x_right.reshape(-1, 1), y_right)
+            xr_pred = np.linspace(0, x_right.max(), npred).reshape(-1, 1)
+            yr_pred = ransac.predict(xr_pred)
+            stdev_r = np.std(y_right - ransac.predict(x_right.reshape(-1, 1)))
+        except (ValueError, IndexError):
+            yr_pred = np.array([0., 0.]); stdev_r = 0.; x_right = np.array([0.])
+        # left
+        try:
+            idx = np.where((xsp2 <= x_min - inner) & (xsp2 >= x_min - outer))
+            x_left = xsp2[idx]; y_left = yspss2[idx]
+            rt = np.std(y_left) * 3
+            ransac2 = RANSACRegressor(estimator=LinearRegression(), residual_threshold=rt)
+            ransac2.fit(x_left.reshape(-1, 1), y_left)
+            xl_pred = np.linspace(x_left.min(), 0, npred).reshape(-1, 1)
+            yl_pred = ransac2.predict(xl_pred)
+            stdev_l = np.std(y_left - ransac2.predict(x_left.reshape(-1, 1)))
+        except (ValueError, IndexError):
+            yl_pred = np.array([0., 0.]); stdev_l = 0.; x_left = np.array([0.])
+
+        offset = yr_pred[0] - yl_pred[-1]
+        combined_std = np.sqrt(stdev_r**2 + stdev_l**2)
+        return offset, combined_std, np.atleast_1d(x_left), np.atleast_1d(x_right)
 
 
     ##  Estimate spatial covariance for EW and NS components

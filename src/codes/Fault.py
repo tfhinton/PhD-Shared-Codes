@@ -11,10 +11,13 @@ class Fault:
 
     Properties:
         trace (geopandas GeoDataFrame): GeoDataFrame holding the fault trace
+        refined_trace (geopandas GeoDataFrame or None): trace relocated onto the
+            peak shear strain, set by OpticalData.evaluate_profiles_fault_aligned.
     '''
 
     def __init__(self, **import_trace_args):
         self.trace = None
+        self.refined_trace = None
         if "filepath" in import_trace_args:
             self.import_trace(**import_trace_args)
     
