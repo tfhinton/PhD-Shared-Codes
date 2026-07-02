@@ -43,7 +43,7 @@ class HamiltonianInversion:
     def _print(self, *args, **kwargs):
         if self.verbose: print(*args, **kwargs)
     
-    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, timeout_minutes=30):
+    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, cores=None, timeout_minutes=30, progressbar=False):
         _self = self._copy()
         _self._print("Starting inversion...")
 
@@ -85,6 +85,7 @@ class HamiltonianInversion:
 
         forward_op = ForwardOp()
 
+        _cores = chains if cores is None else cores
         _start_time = time.time()
 
         def _timeout_callback(*args, **kwargs):
@@ -106,16 +107,22 @@ class HamiltonianInversion:
             # Log-likelihood: multivariate Gaussian with full covariance matrix
             pm.MvNormal("obs", mu=pred, cov=_self.Cd, observed=_self.data)
 
+            _self._print(f"Sampling {chains} chains on {_cores} cores "
+                         f"(draws={draws}, tune={tune}, timeout={timeout_minutes} min) ...")
+            _t0 = time.time()
+
             # Sample with NUTS (the HMC variant PyMC uses by default)
             result = pm.sample(
                 draws=draws,
                 tune=tune,
                 target_accept=target_accept,   # increase for more complex posteriors
                 chains=chains,
+                cores=_cores,
                 return_inferencedata=True,
                 progressbar=True,
                 callback=_timeout_callback,
             )
+            _self._print(f"Sampling done in {(time.time() - _t0) / 60:.1f} min.")
         
         # posterior predictive (linearized)
         with model:
