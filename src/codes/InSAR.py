@@ -335,6 +335,22 @@ class InSAR:
         self._cov_sill        = sill
 
         self._print(f"  Sill={sill:.6f}, Sigma={sigma:.6f}, Lambda={lamda:.1f} m")
+
+        # Degeneracy guard.  On a flat/noisy empirical covariogram the fit can run
+        # away to a delta-like spike: a correlation length shorter than the
+        # covariogram's own bin width (so it decays within the first bin and is
+        # unconstrained) paired with an enormous amplitude.  Such a Cd would
+        # poison the inversion, and because the pixel subsample is random the
+        # failure is intermittent -- so warn unconditionally (not gated by
+        # verbose) and seed the RNG upstream for reproducibility.
+        data_std = float(np.std(self.vel))
+        if lamda < every or sigma > 20. * data_std:
+            print(f"  [WARN] covariance fit looks degenerate "
+                  f"(sigma={sigma:.3g}, lambda={lamda:.1f} m < bin {every:.0f} m, "
+                  f"data std={data_std:.3g}). The random pixel subsample likely "
+                  f"gave a flat covariogram; try a different seed / frac / distmax, "
+                  f"or set sigma,lamda manually via build_Cd(sigma=..., lamda=...).")
+
         return self
 
 

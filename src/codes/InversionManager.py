@@ -500,7 +500,7 @@ class InversionManager:
 
     def _plot_geodetic_map(self, ax, values, raster_label, optical_component,
                            gnss_labels, fault, cmap, vlim, gnss_scale,
-                           colorbar_label, title):
+                           colorbar_label, title, ref_m=None):
         '''
         Core map-plotting implementation shared by plot_map() and plot_residuals().
 
@@ -589,7 +589,9 @@ class InversionManager:
             if not gnss_ref_done:
                 # Reference arrow — placed at lower-right of the full data extent
                 max_de = float(np.max(np.abs(de_vals)))
-                ref_m  = 10. ** np.floor(np.log10(max(max_de, 1e-9)))
+                if ref_m is None:
+                    ref_m  = 10. ** np.floor(np.log10(max(max_de, 1e-9)))
+                print("ref m", ref_m, max_de)
                 all_lons_list = [self.datasets[l].lon for l in gnss_labels
                                  if l in self.datasets]
                 all_lats_list = [self.datasets[l].lat for l in gnss_labels
@@ -632,7 +634,7 @@ class InversionManager:
     def plot_map(self, ax=None, raster_label=None, optical_component='ew',
                  gnss_labels=None, fault=None,
                  cmap=None, vlim=None, gnss_scale=None,
-                 colorbar_label=None, title=None):
+                 colorbar_label=None, title=None, gnss_arrow_length_m=None):
 
         '''
         Plot a geographic overview map of the registered datasets.
@@ -685,7 +687,7 @@ class InversionManager:
 
         self._plot_geodetic_map(ax, values, raster_label, optical_component,
                                 gnss_labels, fault, cmap, vlim, gnss_scale,
-                                colorbar_label, title)
+                                colorbar_label, title, ref_m=gnss_arrow_length_m)
         if created_fig:
             return fig, ax
         return ax
@@ -695,7 +697,7 @@ class InversionManager:
     def plot_residuals(self, ax=None, raster_label=None, optical_component='ew',
                        gnss_labels=None, fault=None,
                        cmap=None, vlim=None, gnss_scale=None,
-                       colorbar_label=None, title=None):
+                       colorbar_label=None, title=None, gnss_arrow_length_m=None):
 
         '''
         Plot a geographic map of post-inversion residuals (data − predicted).
@@ -718,7 +720,7 @@ class InversionManager:
 
         self._plot_geodetic_map(ax, self.residuals, raster_label, optical_component,
                                 gnss_labels, fault, cmap, vlim, gnss_scale,
-                                colorbar_label, title)
+                                colorbar_label, title, ref_m=gnss_arrow_length_m)
         if created_fig:
             return fig, ax
         return ax

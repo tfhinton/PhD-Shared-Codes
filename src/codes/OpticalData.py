@@ -4,8 +4,11 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import copy
+import os
 import warnings
 import functools
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import cmcrameri.cm as cmc
 import pyproj
 import geopandas as gpd
@@ -35,6 +38,126 @@ def _quiet_runtimewarnings(fn):
             warnings.simplefilter('ignore', RuntimeWarning)
             return fn(*args, **kwargs)
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+#  Module-level workers for parallel fault-aligned profile extraction.
+#
+#  The per-profile extraction (the expensive step in
+#  OpticalData.evaluate_profiles_fault_aligned) is embarrassingly parallel.
+#  These live at module scope so they can run in a ProcessPoolExecutor; the
+#  large read-only rasters and geometry arrays are stashed in the module global
+#  ``_FA_WORKER`` once in the parent and inherited by forked workers (copy-on-
+#  write), so they are never pickled per task.
+# ---------------------------------------------------------------------------
+_FA_WORKER = {}
+
+
+def _fa_crop_window(prof_pts, arrays, H, W, expwd=5):
+    '''Crop identical padded raster windows around a set of profile sample points.
+
+    Args:
+        prof_pts (ndarray): (N, 2) array of (col, row) = (x, y) sample coords (px).
+        arrays (list): 2D rasters to crop identically.
+        H, W (int): raster height/width.
+        expwd (int): padding (px) added around the sample bounding box.
+
+    Returns:
+        (cropped_list, tmp_prof) where tmp_prof is the (2, N) [row, col]
+        window-local sample array, or (None, None) if the window is degenerate.
+    '''
+    r0 = int(np.min(prof_pts[:, 1])) - expwd
+    r1 = int(np.max(prof_pts[:, 1])) + expwd
+    c0 = int(np.min(prof_pts[:, 0])) - expwd
+    c1 = int(np.max(prof_pts[:, 0])) + expwd
+    r0c, r1c = max(0, r0), min(H, r1)
+    c0c, c1c = max(0, c0), min(W, c1)
+    if (r1c - r0c) < 3 or (c1c - c0c) < 3:
+        return None, None
+    tmp_prof = np.fliplr(prof_pts).T.copy()   # row 0 = y(row), row 1 = x(col)
+    tmp_prof[0, :] -= r0c
+    tmp_prof[1, :] -= c0c
+    cropped = [a[r0c:r1c, c0c:c1c] for a in arrays]
+    return cropped, tmp_prof
+
+
+def _fa_extract_profile_impl(i, ctx):
+    '''Extract one fault-perpendicular profile (displacement over the full
+    half-length ``plen``; finite strain only over the central ``strain_plen``
+    window around the fault, where it is needed for relocation/FZW).
+
+    Returns (i, cs, ce, strain_arr, disp_arr):
+        strain_arr: (3, 2*strain_plen+1)  rows [shear, dilatation, maxShear]
+        disp_arr:   (4, 2*plen+1)         rows [EW, NS(S+), normal, parallel]
+        cs, ce: inclusive column span (into the full M-length arrays) that
+                ``strain_arr`` occupies.
+    '''
+    ew = ctx['ew']; ns = ctx['ns']
+    H = ctx['H']; W = ctx['W']
+    M = ctx['M']; plen = ctx['plen']; strain_plen = ctx['strain_plen']
+    xres = ctx['xres']; yres = ctx['yres']; expwd = ctx['expwd']
+    angle_i = float(ctx['angle'][i])
+    p1 = (ctx['x1'][i], ctx['y1'][i])
+    p2 = (ctx['x2'][i], ctx['y2'][i])
+
+    prof = np.linspace([p1[0], p1[1]], [p2[0], p2[1]], num=M)   # (M, 2) col, row
+
+    # ----- displacement over the full profile (cheap: no gradients) -----
+    disp_arr = np.full((4, M), np.nan)
+    cropped, tmp_prof = _fa_crop_window(prof, [ew, ns], H, W, expwd)
+    if cropped is not None:
+        ew_win, ns_win = cropped
+        ew_n = ew_win                  # east-positive
+        ns_n = -ns_win                 # north-positive (ns stored south-positive)
+        theta = np.radians(90. - angle_i)
+        par = ew_n * np.cos(theta) + ns_n * np.sin(theta)
+        nrm = -ew_n * np.sin(theta) + ns_n * np.cos(theta)
+        disp_arr[0, :] = map_coordinates(ew_n, tmp_prof, order=1)
+        disp_arr[1, :] = map_coordinates(ns_n, tmp_prof, order=1)
+        disp_arr[2, :] = map_coordinates(nrm, tmp_prof, order=1)
+        disp_arr[3, :] = map_coordinates(par, tmp_prof, order=1)
+
+    # ----- finite strain on the central sub-window only -----
+    cs = plen - strain_plen
+    ce = plen + strain_plen
+    Ms = ce - cs + 1
+    strain_arr = np.full((3, Ms), np.nan)
+    sprof = prof[cs:ce + 1]
+    scrop, stmp = _fa_crop_window(sprof, [ew, ns], H, W, expwd)
+    if scrop is not None:
+        sew, sns = scrop
+        try:
+            with warnings.catch_warnings(), np.errstate(invalid='ignore', divide='ignore'):
+                warnings.simplefilter('ignore', RuntimeWarning)
+                strain = finite_strain(sew.copy(), sns.copy(), xres, yres,
+                                       angle_i, k=1,
+                                       component=['exy', 'dilatation', 'maxShear'])
+                s_shear = np.abs(strain[:, :, 0])
+                s_dil = strain[:, :, 1]
+                s_maxsh = strain[:, :, 2]
+                # protect a central band (fault core) from outlier removal. For the
+                # full-strain default this is column ``plen`` (original behaviour);
+                # for a restricted strain window it is the fault's window-local col.
+                if strain_plen == plen:
+                    prot = plen
+                else:
+                    wln = sew.shape[1]
+                    prot = int(round(stmp[1, strain_plen]))
+                    prot = min(max(prot, 15), max(15, wln - 15))
+                s_shear = remove_marginal_outliers(s_shear, prot, 15, 0.5)
+                s_dil = remove_marginal_outliers(s_dil, prot, 15, 0.5)
+                strain_arr[0, :] = map_coordinates(s_shear, stmp, order=1)
+                strain_arr[1, :] = map_coordinates(s_dil, stmp, order=1)
+                strain_arr[2, :] = map_coordinates(s_maxsh, stmp, order=1)
+        except Exception:
+            pass
+
+    return i, cs, ce, strain_arr, disp_arr
+
+
+def _fa_extract_profile(i):
+    '''Pool entry point: reads the forked-in context from the module global.'''
+    return _fa_extract_profile_impl(i, _FA_WORKER)
 
 
 ###   OpticalData class
@@ -453,6 +576,8 @@ class OpticalData:
     def evaluate_profiles_fault_aligned(
             self, fault,
             plen=500, stack=300, trace_smooth=15,
+            strain_half_width=None, n_jobs=None, expwd=5,
+            prof_dtype=np.float64,
             shift_cap=8, shift_cap_final=4,
             background_limit=(-750., 750.),
             near_field_limit=(10., 60.),
@@ -485,9 +610,31 @@ class OpticalData:
                 the optical rasters) provides the rupture trace.
 
         Kwargs:
-            plen (int): fault-perpendicular profile half-length, in pixels.
+            plen (int): fault-perpendicular profile half-length, in pixels. The
+                displacement profile spans the full +/-plen; making this large
+                (e.g. 5000 for 5 km at 1 m/px) only adds cheap displacement
+                sampling, not strain cost (see strain_half_width).
             stack (int): along-strike half-window (in profiles/pixels) for stacking.
             trace_smooth (int): boxcar width (px) for smoothing the rasterised trace.
+            strain_half_width (float or None): half-width (in the SAME pixel units
+                as plen, i.e. metres at 1 m/px) of the central window over which
+                finite strain is computed. Strain is only used to relocate the
+                profile onto the true fault (peak shear) and to estimate the
+                fault-zone width, so it need only span the likely fault-location
+                error (~100 m) plus the fault zone. Restricting it makes strain
+                cost independent of plen — essential for long profiles. ``None``
+                (default) computes strain over the full +/-plen (original
+                behaviour, identical results). Clamped to [4, plen] px.
+            n_jobs (int or None): number of worker processes for the per-profile
+                extraction loop. ``None`` or 1 runs serially (the only safe mode
+                on macOS spawn); >1 uses a forked ProcessPoolExecutor (Linux).
+                Pass e.g. os.cpu_count().
+            expwd (int): padding (px) around each profile's raster window.
+            prof_dtype (numpy dtype): storage dtype for the (n_prof, 4, 2*plen+1)
+                profile/stack buffers. Defaults to float64 (validated). Pass
+                np.float32 to roughly halve memory for very long profiles over a
+                long fault (e.g. plen=5000 over the whole trace), at negligible
+                precision cost for these displacement/strain magnitudes.
             shift_cap (float): max |shift| (px) allowed in the first relocation.
             shift_cap_final (float): max |shift| (px) allowed in the second relocation.
             background_limit (tuple): (left, right) px bounds of the far-field region
@@ -527,6 +674,18 @@ class OpticalData:
         disp_ns_fill = -self.ns.values.astype(float)   # south-positive (script convention)
         H, W = disp_ew_fill.shape
 
+        # strain half-length (px): full profile by default, else the requested
+        # central window (clamped). Strain cost ~ window area, so this is the key
+        # control on speed for long profiles.
+        if strain_half_width is None:
+            strain_plen = plen
+        else:
+            strain_plen = int(round(strain_half_width / xres))
+        strain_plen = int(np.clip(strain_plen, 4, plen))
+
+        # worker count for the extraction loop
+        n_jobs = 1 if n_jobs is None else max(1, min(int(n_jobs), os.cpu_count() or 1))
+
         # ----- 1. rasterise + smooth the fault trace into pixel coordinates -----
         x, y, angle, x0, y0 = self._rasterise_and_strike(fault, transform, xres, trace_smooth)
         n_prof = x0.shape[0]
@@ -548,44 +707,40 @@ class OpticalData:
         # ----- 2/3. extract strain and displacement profiles -----
         # prof_store_strain rows: 0 shear, 1 dilatation, 2 maxShear, 3 unused
         # prof_store_disp   rows: 0 EW, 1 NS(S+), 2 fault-normal, 3 fault-parallel
-        prof_store_strain = np.full((n_prof, 4, M), np.nan)
-        prof_store_disp = np.full((n_prof, 4, M), np.nan)
+        prof_store_strain = np.full((n_prof, 4, M), np.nan, dtype=prof_dtype)
+        prof_store_disp = np.full((n_prof, 4, M), np.nan, dtype=prof_dtype)
 
-        for i in range(n_prof):
-            if self.verbose and (i % 200 == 0):
-                self._print(f"  extracting profile {i} of {n_prof}")
-            window, tmp_prof = self._profile_window(
-                (x1[i], y1[i]), (x2[i], y2[i]), M, disp_ew_fill, disp_ns_fill, H, W)
-            if window is None:
-                continue
-            (ew_win, ns_win) = window
+        # context shared with the (optionally parallel) per-profile workers
+        global _FA_WORKER
+        _FA_WORKER = dict(
+            ew=disp_ew_fill, ns=disp_ns_fill, H=H, W=W, M=M,
+            plen=plen, strain_plen=strain_plen, xres=xres, yres=yres,
+            expwd=expwd, angle=angle, x1=x1, y1=y1, x2=x2, y2=y2)
 
-            # strain
-            try:
-                strain_out = finite_strain(ew_win.copy(), ns_win.copy(), xres, yres,
-                                           angle[i], k=1,
-                                           component=['exy', 'dilatation', 'maxShear'])
-                s_shear = np.abs(strain_out[:, :, 0])
-                s_dil = strain_out[:, :, 1]
-                s_maxsh = strain_out[:, :, 2]
-                s_shear = remove_marginal_outliers(s_shear, plen, 15, 0.5)
-                s_dil = remove_marginal_outliers(s_dil, plen, 15, 0.5)
-                prof_store_strain[i, 0, :] = map_coordinates(s_shear, tmp_prof, order=1)
-                prof_store_strain[i, 1, :] = map_coordinates(s_dil, tmp_prof, order=1)
-                prof_store_strain[i, 2, :] = map_coordinates(s_maxsh, tmp_prof, order=1)
-            except Exception:
-                pass
+        def _store(res):
+            i, cs, ce, strain_arr, disp_arr = res
+            prof_store_strain[i, 0:3, cs:ce + 1] = strain_arr
+            prof_store_disp[i, :, :] = disp_arr
 
-            # displacement (rotate EW/N into fault-parallel / fault-normal)
-            ew_n = ew_win                  # east-positive
-            ns_n = -ns_win                 # north-positive
-            theta = np.radians(90. - angle[i])
-            par = ew_n * np.cos(theta) + ns_n * np.sin(theta)
-            nrm = -ew_n * np.sin(theta) + ns_n * np.cos(theta)
-            prof_store_disp[i, 0, :] = map_coordinates(ew_n, tmp_prof, order=1)
-            prof_store_disp[i, 1, :] = map_coordinates(ns_n, tmp_prof, order=1)
-            prof_store_disp[i, 2, :] = map_coordinates(nrm, tmp_prof, order=1)
-            prof_store_disp[i, 3, :] = map_coordinates(par, tmp_prof, order=1)
+        self._print(f"Extracting {n_prof} profiles "
+                    f"(plen={plen}px, strain_plen={strain_plen}px, n_jobs={n_jobs})")
+        if n_jobs == 1:
+            for i in range(n_prof):
+                if self.verbose and (i % 200 == 0):
+                    self._print(f"  extracting profile {i} of {n_prof}")
+                _store(_fa_extract_profile_impl(i, _FA_WORKER))
+        else:
+            # forked workers inherit _FA_WORKER (copy-on-write); nothing is
+            # pickled per task except the integer index and the small result.
+            mp_ctx = mp.get_context("fork")
+            with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp_ctx) as ex:
+                futures = [ex.submit(_fa_extract_profile, i) for i in range(n_prof)]
+                for done, fut in enumerate(as_completed(futures)):
+                    if self.verbose and (done % 200 == 0):
+                        self._print(f"  extracted {done} of {n_prof}")
+                    _store(fut.result())
+
+        _FA_WORKER = {}   # release the shared rasters held for the workers
 
         # ----- 4. first relocation: shift each profile onto peak shear strain -----
         w_shift = smoothed_boxcar(plen, 25, 1)
@@ -606,9 +761,11 @@ class OpticalData:
         # strain stats rows: 0 med shear,1 std,2 med dil,3 std,4 med maxShear,5 std
         # disp   stats rows: 0 med EW,1 std,2 med NS,3 std,4 med normal,5 std,6 med par,7 std
         strain_stats = self._stack(prof_store_strain, stack, plen, gate_row=1,
-                                   med_rows=(0, 1, 2), out_rows=(0, 2, 4))
+                                   med_rows=(0, 1, 2), out_rows=(0, 2, 4),
+                                   min_cols=(2 * strain_plen) // 3)
         disp_stats = self._stack(prof_store_disp, stack, plen, gate_row=1,
-                                 med_rows=(0, 1, 2, 3), out_rows=(0, 2, 4, 6))
+                                 med_rows=(0, 1, 2, 3), out_rows=(0, 2, 4, 6),
+                                 min_cols=plen // 1.5)
         sl = slice(stack, n_prof - stack)
         strain_stats = strain_stats[sl]
         disp_stats = disp_stats[sl]
@@ -631,7 +788,8 @@ class OpticalData:
             j = ff + stack   # index into full-length trace arrays
             result, shifted = self._analyse_profile(
                 ff, strain_stats, disp_stats, prof_dist_pxls, plen, xres,
-                background_limit, near_field_limit, far_field_limit, stdthr)
+                background_limit, near_field_limit, far_field_limit, stdthr,
+                strain_plen)
             table[ff, :len(result)] = result
 
             # build Profile (geometry in raster CRS, displacements in metres)
@@ -795,16 +953,21 @@ class OpticalData:
                     prof_store[i, p, :] = np.nan
 
     @staticmethod
-    def _stack(prof_store, stack, plen, gate_row, med_rows, out_rows):
+    def _stack(prof_store, stack, plen, gate_row, med_rows, out_rows, min_cols=None):
         '''Median+std stack each profile over +/-stack along-strike neighbours.
         med_rows are source channels; out_rows are the median destination rows in
-        the (n, 8, M) output (std goes to out_row+1).'''
+        the (n, 8, M) output (std goes to out_row+1). ``min_cols`` is the minimum
+        number of well-populated columns required to accept a stack; it defaults
+        to plen/1.5 (the full-profile threshold) but is reduced for the strain
+        channels when strain is computed over only a central window.'''
+        if min_cols is None:
+            min_cols = plen // 1.5
         n, _, M = prof_store.shape
-        stats = np.full((n, 8, M), np.nan)
+        stats = np.full((n, 8, M), np.nan, dtype=prof_store.dtype)
         for i in range(stack, n - stack):
             block_gate = prof_store[i - stack:i + stack, gate_row, :]
             track_nan = np.sum(np.isnan(block_gate), axis=0)
-            if np.sum(track_nan < stack // 3) >= plen // 1.5:
+            if np.sum(track_nan < stack // 3) >= min_cols:
                 for src, dst in zip(med_rows, out_rows):
                     block = prof_store[i - stack:i + stack, src, :]
                     stats[i, dst, :] = np.nanmedian(block, axis=0)
@@ -871,9 +1034,16 @@ class OpticalData:
 
     def _analyse_profile(self, ff, strain_stats, disp_stats, prof_dist_pxls,
                          plen, xres, background_limit, near_field_limit,
-                         far_field_limit, stdthr):
+                         far_field_limit, stdthr, strain_plen=None):
         '''Per-profile detrend / fault-zone-width / offset analysis. Returns
-        (result_store [len 42], result_shifted [3, M] = shear/dil/parallel).'''
+        (result_store [len 42], result_shifted [3, M] = shear/dil/parallel).
+
+        ``strain_plen`` is the half-width (px) over which strain exists; when it is
+        smaller than plen the background-strain detrend band and the minimum
+        valid-point check are pulled inside the strain window so they still have
+        data. Defaults to plen (full-profile strain, original behaviour).'''
+        if strain_plen is None:
+            strain_plen = plen
         M = prof_dist_pxls.shape[0]
         result = np.full(42, np.nan)
         shifted = np.zeros((3, M))
@@ -888,7 +1058,10 @@ class OpticalData:
         valid2 = (np.isnan(yspd) + (yspd == 0)) < 1
         valid3 = (np.isnan(yspss) + (yspss == 0)) < 1
 
-        if valid.sum() < ysp.shape[0] * 0.5:
+        # require enough valid strain points: half the profile for full strain,
+        # or half the (smaller) strain window when strain is restricted.
+        min_valid = min(int(ysp.shape[0] * 0.5), strain_plen)
+        if valid.sum() < min_valid:
             return result, shifted
 
         xsp2 = xsp[valid]
@@ -900,8 +1073,15 @@ class OpticalData:
         x_min2 = np.nan; x_max2 = np.nan; fzw2 = np.nan
 
         # --- detrend background shear strain via RANSAC polynomial ---
+        # when strain is restricted to a central window, pull the background band
+        # (which lies OUTSIDE +/-background_limit) inward so it still has data.
+        if strain_plen < plen:
+            bg_lo = max(background_limit[0], -0.6 * strain_plen)
+            bg_hi = min(background_limit[1], 0.6 * strain_plen)
+        else:
+            bg_lo, bg_hi = background_limit[0], background_limit[1]
         try:
-            bg = (xsp2 <= background_limit[0]) | (xsp2 >= background_limit[1])
+            bg = (xsp2 <= bg_lo) | (xsp2 >= bg_hi)
             xx = xsp2[bg].reshape(-1, 1)
             yy = ysp[valid][bg].reshape(-1, 1)
             ransac_in = RANSACRegressor(min_samples=0.6,
@@ -1365,8 +1545,8 @@ class OpticalData:
             ax.set_ylabel("Longitude (˚)")
 
             if fault is not None:
-                fault = fault.trace_to_crs("EPSG:4326")
-                fault.trace.plot(ax=ax, color="black", linewidth=2.)
+                trace = fault.trace.to_crs("EPSG:4326")
+                trace.plot(ax=ax, color="black", linewidth=2.)
             if profiles is not None:
                 for p in profiles:
                     if profile_swathe_width is not None:

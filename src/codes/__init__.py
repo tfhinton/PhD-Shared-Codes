@@ -13,7 +13,8 @@ from .CSIWrapper import CSIWrapper
 from . import utils
 from . import Styles
 from .Fault3d import Fault3d, Patch, Cell, compute_okada
+from .FaultTriangles import FaultTriangles
 from .InSAR import InSAR
 from .GNSS import GNSS
 
-__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "Fault3d", "Patch", "Cell", "compute_okada", "InSAR", "GNSS"]
+__all__ = ["OpticalData", "Fault", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "Fault3d", "Patch", "Cell", "compute_okada", "FaultTriangles", "InSAR", "GNSS"]
