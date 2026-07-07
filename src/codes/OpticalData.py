@@ -112,10 +112,12 @@ def _fa_extract_profile_impl(i, ctx):
         theta = np.radians(90. - angle_i)
         par = ew_n * np.cos(theta) + ns_n * np.sin(theta)
         nrm = -ew_n * np.sin(theta) + ns_n * np.cos(theta)
-        disp_arr[0, :] = map_coordinates(ew_n, tmp_prof, order=1)
-        disp_arr[1, :] = map_coordinates(ns_n, tmp_prof, order=1)
-        disp_arr[2, :] = map_coordinates(nrm, tmp_prof, order=1)
-        disp_arr[3, :] = map_coordinates(par, tmp_prof, order=1)
+        # cval=nan: samples outside the loaded raster window must read as gaps,
+        # not as exactly 0, or they pollute the far-field bands downstream
+        disp_arr[0, :] = map_coordinates(ew_n, tmp_prof, order=1, cval=np.nan)
+        disp_arr[1, :] = map_coordinates(ns_n, tmp_prof, order=1, cval=np.nan)
+        disp_arr[2, :] = map_coordinates(nrm, tmp_prof, order=1, cval=np.nan)
+        disp_arr[3, :] = map_coordinates(par, tmp_prof, order=1, cval=np.nan)
 
     # ----- finite strain on the central sub-window only -----
     cs = plen - strain_plen
@@ -138,17 +140,18 @@ def _fa_extract_profile_impl(i, ctx):
                 # protect a central band (fault core) from outlier removal. For the
                 # full-strain default this is column ``plen`` (original behaviour);
                 # for a restricted strain window it is the fault's window-local col.
+                buf = int(ctx.get('prot_buffer', 15))
                 if strain_plen == plen:
                     prot = plen
                 else:
                     wln = sew.shape[1]
                     prot = int(round(stmp[1, strain_plen]))
-                    prot = min(max(prot, 15), max(15, wln - 15))
-                s_shear = remove_marginal_outliers(s_shear, prot, 15, 0.5)
-                s_dil = remove_marginal_outliers(s_dil, prot, 15, 0.5)
-                strain_arr[0, :] = map_coordinates(s_shear, stmp, order=1)
-                strain_arr[1, :] = map_coordinates(s_dil, stmp, order=1)
-                strain_arr[2, :] = map_coordinates(s_maxsh, stmp, order=1)
+                    prot = min(max(prot, buf), max(buf, wln - buf))
+                s_shear = remove_marginal_outliers(s_shear, prot, buf, 0.5)
+                s_dil = remove_marginal_outliers(s_dil, prot, buf, 0.5)
+                strain_arr[0, :] = map_coordinates(s_shear, stmp, order=1, cval=np.nan)
+                strain_arr[1, :] = map_coordinates(s_dil, stmp, order=1, cval=np.nan)
+                strain_arr[2, :] = map_coordinates(s_maxsh, stmp, order=1, cval=np.nan)
         except Exception:
             pass
 
@@ -578,7 +581,7 @@ class OpticalData:
             plen=500, stack=300, trace_smooth=15,
             strain_half_width=None, n_jobs=None, expwd=5,
             prof_dtype=np.float64,
-            shift_cap=8, shift_cap_final=4,
+            shift_cap=8, shift_cap_final=4, search_half_width=None,
             background_limit=(-750., 750.),
             near_field_limit=(10., 60.),
             far_field_limit=None,
@@ -637,6 +640,17 @@ class OpticalData:
                 precision cost for these displacement/strain magnitudes.
             shift_cap (float): max |shift| (px) allowed in the first relocation.
             shift_cap_final (float): max |shift| (px) allowed in the second relocation.
+            search_half_width (float or None): half-width (px) of the window,
+                centred on the drawn trace, searched for the peak shear strain
+                in the first relocation. ``None`` (default) keeps the original
+                hard-coded ~12 px window. The drawn trace can only be corrected
+                within this window, so it must exceed the likely trace error;
+                values up to ``strain_half_width`` are sensible. Widening it also
+                widens the central band protected from strain outlier removal
+                (which would otherwise suppress the true fault's strain peak),
+                and raises ``shift_cap`` to at least this value. Keep it below
+                the distance to the nearest parallel strand, or the relocation
+                may lock onto the wrong fault.
             background_limit (tuple): (left, right) px bounds of the far-field region
                 used to detrend the background strain.
             near_field_limit (tuple): (inner, outer) px window for the near-field
@@ -683,6 +697,18 @@ class OpticalData:
             strain_plen = int(round(strain_half_width / xres))
         strain_plen = int(np.clip(strain_plen, 4, plen))
 
+        # first-relocation peak-search window (px): original behaviour is a
+        # ~12 px hard-coded boxcar; a wider window lets the relocation correct
+        # larger drawn-trace errors (it needs the outlier-protected band and the
+        # shift cap to cover it, or the peak it should move to is masked/culled)
+        if search_half_width is None:
+            search_support, prot_buffer = 25, 15
+        else:
+            search_half_width = int(np.clip(search_half_width, 12, strain_plen))
+            search_support = 2 * search_half_width + 1
+            prot_buffer = max(15, search_half_width + 5)
+            shift_cap = max(shift_cap, search_half_width)
+
         # worker count for the extraction loop
         n_jobs = 1 if n_jobs is None else max(1, min(int(n_jobs), os.cpu_count() or 1))
 
@@ -715,7 +741,8 @@ class OpticalData:
         _FA_WORKER = dict(
             ew=disp_ew_fill, ns=disp_ns_fill, H=H, W=W, M=M,
             plen=plen, strain_plen=strain_plen, xres=xres, yres=yres,
-            expwd=expwd, angle=angle, x1=x1, y1=y1, x2=x2, y2=y2)
+            expwd=expwd, angle=angle, x1=x1, y1=y1, x2=x2, y2=y2,
+            prot_buffer=prot_buffer)
 
         def _store(res):
             i, cs, ce, strain_arr, disp_arr = res
@@ -743,7 +770,7 @@ class OpticalData:
         _FA_WORKER = {}   # release the shared rasters held for the workers
 
         # ----- 4. first relocation: shift each profile onto peak shear strain -----
-        w_shift = smoothed_boxcar(plen, 25, 1)
+        w_shift = smoothed_boxcar(plen, search_support, 1)
         store_shifts = np.zeros(n_prof)
         for i in range(n_prof):
             store_shifts[i] = self._locate_peak_shift(
@@ -1025,9 +1052,9 @@ class OpticalData:
                 try:
                     g = interp1d(prof_dist_pxls[valid] - sh, col[valid],
                                  kind='slinear', bounds_error=False, fill_value=np.nan)
-                    out = g(prof_dist_pxls)
-                    out[np.isnan(out)] = 0.
-                    arr[ff, row, :] = out
+                    # samples shifted outside the data range stay NaN (a 0 fill
+                    # would fabricate zero displacement at the profile ends)
+                    arr[ff, row, :] = g(prof_dist_pxls)
                 except Exception:
                     pass
         return shifts2
