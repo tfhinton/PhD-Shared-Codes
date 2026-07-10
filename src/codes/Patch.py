@@ -3,7 +3,7 @@ class PatchTwoD:
         self.x = x
         self.z = z
         self.dd_width = dd_width
-        self.dip = 90.
+        self.dip = dip
     
     @property
     def top(self):

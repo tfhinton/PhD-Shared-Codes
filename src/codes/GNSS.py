@@ -162,7 +162,7 @@ class GNSS:
         self._print(f"  Loaded {len(self.sta)} stations")
 
         if fault is not None and max_dist is not None:
-            fault_geom = fault.trace.geometry.unary_union
+            fault_geom = fault.get_surface_trace_xy().geometry.unary_union
             dists = np.array([Point(xi, yi).distance(fault_geom)
                               for xi, yi in zip(self.x, self.y)])
             u = np.flatnonzero(dists <= max_dist)
@@ -237,7 +237,7 @@ class GNSS:
 
         Kwargs:
             ax (Axes or None): Axes to plot on; new figure created if None.
-            fault: Fault3d object with a .trace GeoDataFrame (UTM CRS), or None.
+            fault: Fault3d object with a .get_surface_trace_xy() GeoDataFrame (UTM CRS), or None.
             scale (float): Quiver scale (data units per plot-coordinate unit).
                 Larger values make arrows shorter.  Auto-computed if None.
             title (str): Axes title.
@@ -277,7 +277,7 @@ class GNSS:
                 f'{ref_m * 1000:.0f} mm', ha='center', va='top', fontsize=8)
 
         if fault is not None and hasattr(fault, 'trace'):
-            for geom in fault.trace.geometry:
+            for geom in fault.get_surface_trace_xy().geometry:
                 lines = ([geom] if isinstance(geom, LineString)
                          else list(geom.geoms))
                 for line in lines:

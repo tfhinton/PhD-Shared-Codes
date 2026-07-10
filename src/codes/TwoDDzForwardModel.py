@@ -14,6 +14,15 @@ class TwoDDzForwardModel:
     The model is a 2D slip model in an elastic medium with a reduced-elastic-modulus damage zone around the fault,
     after equations in Segall (2010).
 
+    Dipping faults: the compliant zone stays vertical (|x| < dz_half_width, centred
+    on the surface trace) but each patch is an inclined segment between endpoints
+    (patch.x_top, patch.top) and (patch.x_bot, patch.bottom). The field of uniform
+    slip on a segment is the difference of two screw-dislocation-line fields, and
+    each line's field in the zoned half-space is an image series generalising
+    Segall's: for a line at horizontal offset x0 the images sit at +-2mh + (-1)^m x0
+    (in-zone source) or at the slab-reflection positions (out-of-zone source).
+    Vertical patches (x_top == x_bot == 0) reproduce the original expressions exactly.
+
     Properties:
         patches (list of PatchTwoD): n segments of the fault
         slips (np array, dim n): amount of slip on each of the n patches
@@ -38,21 +47,42 @@ class TwoDDzForwardModel:
         return copy.copy(self)
     
 
-    # Method to compute surface displacement due to slip on a single patch
+    # Method to compute surface displacement due to slip on a single patch.
+    # The patch is the inclined segment (x_top, top) -> (x_bot, bottom); its field is
+    # the difference of the two endpoint dislocation-line fields.
     def run_for_patch(self, xs, patch, slip, dz_half_width, modulus_ratio):
-        
+
         # Estimate length of series required for convergence
         tol = 1e-6
-        m_max = int(np.ceil(np.log(tol) / np.log(abs((1-modulus_ratio) / (1+modulus_ratio)))))
+        k = (1. - modulus_ratio) / (1. + modulus_ratio)
+        if abs(k) < 1e-12 or dz_half_width < 1e-3:   # homogeneous limit
+            k, m_max = 0., 0
+        else:
+            m_max = int(np.ceil(np.log(tol) / np.log(abs(k))))
 
-        # Compute solution down to bottom
-        sol = compute_two_d_dz(xs, patch.bottom, slip, dz_half_width, modulus_ratio, m_max)
+        x_top = getattr(patch, "x_top", patch.x)
+        x_bot = getattr(patch, "x_bot", patch.x)
 
-        # Subtract solution down to top
-        if patch.top > 0.:
-            sol -= compute_two_d_dz(xs, patch.top, slip, dz_half_width, modulus_ratio, m_max)
-        
-        return sol
+        sol = dislocation_line_dz(xs, x_bot, patch.bottom, dz_half_width, k, m_max)
+        sol -= dislocation_line_dz(xs, x_top, patch.top, dz_half_width, k, m_max)
+        return slip * sol
+
+
+    # Helper method to build patches for a dipping fault: interfaces are the depth
+    # interfaces (m, len n+1) and x_offsets the horizontal position of the fault at
+    # each interface (m, +x side, same length). All zeros = vertical fault.
+    def build_dipping_patches(self, interfaces, x_offsets, initialise_slip=0.):
+        _self = self._copy()
+        patches = []
+        for i in range(len(interfaces) - 1):
+            p = PatchTwoD(x=(x_offsets[i] + x_offsets[i+1]) / 2.,
+                          z=(interfaces[i] + interfaces[i+1]) / 2.,
+                          dd_width=interfaces[i+1] - interfaces[i])
+            p.x_top, p.x_bot = float(x_offsets[i]), float(x_offsets[i+1])
+            patches.append(p)
+        _self.patches = patches
+        _self.slips = np.full(len(patches), float(initialise_slip))
+        return _self
     
 
     # Method to run the forward model
@@ -252,3 +282,88 @@ def compute_two_d_dz(xs, depth, slip, dz_half_width, modulus_ratio, m_max):
         
         sol[i] = total
     return sol
+
+@njit(cache=True)
+def dislocation_line_dz(xs, x0, d, h, k, m_max):
+    '''Surface displacement (unit slip) of a screw dislocation line at (x0, depth d)
+    in a half-space with a vertical compliant zone |x| < h (image strength
+    k = (mu1-mu2)/(mu1+mu2)). Image series generalise Segall (2010) / Ragon &
+    Simons (2021) eq. A12 to an off-centre (possibly out-of-zone) source; the
+    branch cut runs from the line up to the surface at x = x0, so each line
+    carries a step of 1 there and the -+1/2 far-field antisymmetry.
+    m_max = 0 (or h ~ 0) computes the homogeneous half-space solution.'''
+    n = xs.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    homog = (k == 0.) or (m_max <= 0) or (h < 1e-3)
+
+    for i in range(n):
+        x = xs[i]
+
+        if homog:
+            val = _atan_dx(d, x - x0) / np.pi
+
+        elif abs(x0) <= h:
+            # source inside the zone: images at +-2mh + (-1)^m x0, strength k^m
+            if abs(x) <= h:
+                s = _atan_dx(d, x - x0)
+                km = 1.
+                for m in range(1, m_max + 1):
+                    km *= k
+                    em = x0 if m % 2 == 0 else -x0
+                    s += km * (_atan_dx(d, x - (2.*m*h + em))
+                               + _atan_dx(d, x - (-2.*m*h + em)))
+            else:
+                # observer outside: transmitted images march away from it
+                sd = 1. if x > 0. else -1.
+                s = 0.
+                km = 1. - k
+                for m in range(0, m_max + 1):
+                    em = x0 if m % 2 == 0 else -x0
+                    s += km * _atan_dx(d, x - (-sd*2.*m*h + em))
+                    km *= k
+            val = s / np.pi
+
+        else:
+            # source outside the zone; mirror so the source sits at xx0 > h
+            sx = 1. if x0 > 0. else -1.
+            xx, xx0 = sx * x, sx * x0
+            if xx > h:
+                # source side: direct + wall reflection + multiples through the slab
+                s = _atan_dx(d, xx - xx0) - k * _atan_dx(d, xx - (2.*h - xx0))
+                kj = (1. - k*k) * k
+                for j in range(1, m_max // 2 + 2):
+                    s += kj * _atan_dx(d, xx + ((4.*j - 2.)*h + xx0))
+                    kj *= k * k
+            elif xx >= -h:
+                # inside the zone: transmitted source + internal reflections
+                s = 0.
+                km = 1. + k
+                for m in range(0, m_max + 1):
+                    pm = (2.*m*h + xx0) if m % 2 == 0 else -(2.*m*h + xx0)
+                    s += km * _atan_dx(d, xx - pm)
+                    km *= k
+            else:
+                # opposite side: only even-order multiples get through
+                s = 0.
+                kj = 1. - k*k
+                for j in range(0, m_max // 2 + 2):
+                    s += kj * _atan_dx(d, xx - (xx0 + 4.*j*h))
+                    kj *= k * k
+            val = sx * s / np.pi
+
+        # branch cut to the surface at x0: continuous there, antisymmetric far field
+        if x > x0:
+            val -= 0.5
+        elif x < x0:
+            val += 0.5
+        out[i] = val
+    return out
+
+
+@njit(cache=True)
+def _atan_dx(d, dx):
+    # arctan(d / dx) as in Segall's surface expressions; 0 at the (measure-zero)
+    # singular points to keep numba happy
+    if dx == 0. or d == 0.:
+        return 0.
+    return np.arctan(d / dx)

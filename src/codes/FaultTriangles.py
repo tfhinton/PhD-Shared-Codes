@@ -1,108 +1,49 @@
-"""Triangular-dislocation-element (TDE) fault for half-space Green's functions.
-
-The rectangular :class:`~codes.Fault3d.Fault3d` workflow uses Okada (1985)
-patches; this module is its triangular counterpart, built on the Meade (2007)
-TDE displacements (``codes.meade07``, the CSI translation of Brendan Meade's
-MATLAB code).  It consumes the depth-layered triangular mesh produced by
-``scripts/remeshFault.py`` (a ``RemeshedFault`` / its ``.npz``) and returns
-surface-displacement Green's functions in the *same* convention and array layout
-as ``Fault3d.compute_greens_functions`` so the rest of the inversion pipeline is
-unchanged.
-
-Conventions (validated to machine precision against the trusted Okada reference
-``scripts/_okada_check.py`` by splitting one rectangle into two TDEs, per Meade
-2007 Fig. 6 -- agreement ~1e-14):
-
-* **Inversion unit = one triangle.**  ``self.gfs`` has shape
-  ``(2, n_patches, 3, n_pts)``: axis 0 = ``[strike-slip, dip-slip]``,
-  axis 2 = ``[east, north, up]`` -- identical to ``Fault3d.gfs``.
-* **Vertices** are stored z-up / datum-shifted exactly as the mesh gives them
-  (z = 0 free surface, fault at z <= 0).  ``meade07`` internally wants depth
-  positive-down, so we feed it ``-z``.  (The remesh handover's suggestion to feed
-  z-up straight in applies to Nikkhoo-style TDE codes; CSI's ``meade07`` -- which
-  stores ``self.depth = max(vertex_z)`` -- wants positive-down, so we convert.)
-* **Sign convention matches Okada/Fault3d.**  ``meade07``'s strike-slip is the
-  negative of Okada's ``U1`` (its dip-slip already matches ``U2``), so the
-  strike-slip Green's function is negated here.  Positive strike-slip and
-  positive dip-slip therefore mean the same thing they do for the rectangular
-  patches.  ``meade07`` forces each element normal to point +z (clockwise-from-
-  above winding) before resolving slip, so the strike/dip sense is fixed by the
-  triangle geometry alone and is independent of the mesh's stored winding.
-"""
-
 import numpy as np
 import copy
+import pickle
+from pathlib import Path
 
 from . import meade07
 
 
 class FaultTriangles:
-    """A triangular-mesh fault with Meade (2007) half-space Green's functions.
+    """A triangular-mesh fault with Meade (2007) half-space Green's functions
 
-    Each triangle is one inversion unit (one slip value), unlike the rectangular
-    ``Fault3d`` where the unit is an even-width ``Cell`` grouping many sub-patches.
-
-    Attributes
+    Properties
     ----------
     vertices : (V, 3) float
-        Shared vertex array, z-up / datum-shifted (metres; z = 0 at surface,
-        fault at z <= 0), matching ``RemeshedFault.vertices``.
+        z is up, free surface at z=0
     triangles : (T, 3) int
-        0-based connectivity into ``vertices``.
+        indices of ``vertices``.
     layers : (T,) int or None
-        Depth-band index per triangle (0 = shallowest), used to keep the mesh
-        separable at depth contours.
+        If layered mesh, the layer index of each triangle; otherwise ``None``.
     slips : (T,) float
-        Slip value per triangle (aligned with ``triangles``); zero until set.
+        Slip value per triangle
     gfs : (2, T, 3, n_pts) float
-        Green's functions after :meth:`compute_greens_functions`.
+        Green's functions populated by `compute_greens_functions`.
     """
 
-    def __init__(self, vertices, triangles, layers=None, datum=0.0,
-                 name="fault_triangles", nu=0.25, winding_ref=None):
+    def __init__(self, vertices, triangles, layers=None, nu=0.25, name="Fault"):
         self.vertices = np.asarray(vertices, dtype=float)
         self.triangles = np.asarray(triangles, dtype=int)
         self.layers = None if layers is None else np.asarray(layers, dtype=int)
-        self.datum = float(datum)
-        self.name = str(name)
-        self.nu = float(nu)
-        self.winding_ref = (None if winding_ref is None
-                            else np.asarray(winding_ref, dtype=float))
+        self.nu = float(nu)  # Poisson's ratio
         self.slips = np.zeros(len(self.triangles))
         self.gfs = None
-        # Optional per-strand reference normals fixing a consistent dip-slip
-        # sense (see set_dip_convention / compute_greens_functions). None ->
-        # meade07's per-element forced-up normal decides the DS sense.
-        self.dip_reference = None
-        # Per-triangle strand index (0 for a single mesh); populated by merge().
-        self.fault_ids = np.zeros(len(self.triangles), dtype=int)
-        self.component_names = [self.name]
-        # Cached surface-trace polylines (one per strand); built lazily by .trace.
-        self._trace_lines = None
+        self.dip_reference = None  # Optional per-subfault reference normals fixing a consistent dip-slip
+        self.fault_ids = np.zeros(len(self.triangles), dtype=int)  # Per-triangle subfault index
+        self.name = name
+        self.subfault_names = {0: name}
 
-    # ------------------------------------------------------------------ #
-    #  Constructors
-    # ------------------------------------------------------------------ #
+    ## Helper method to return a deep copy of the class instance
+    def _copy(self):
+        return copy.copy(self)
+
+    ####    Merge several FaultTriangles into one    ####
     @classmethod
-    def from_remesh(cls, rf, nu=0.25):
-        """Build from a ``scripts/remeshFault.RemeshedFault`` object."""
-        return cls(rf.vertices, rf.triangles, layers=rf.layers, datum=rf.datum,
-                   name=rf.name, nu=nu, winding_ref=rf.winding_ref)
-
-    @classmethod
-    def merge(cls, faults, name="merged_fault"):
-        """Concatenate several meshes into one fault (patches stay per-triangle).
-
-        Vertices are stacked and triangle indices offset, so the merged object
-        behaves as a single fault for InSAR/GNSS/InversionManager (one combined
-        ``compute_greens_functions`` and one multi-line ``.trace``), while
-        ``fault_ids`` records which strand each triangle came from -- used by
-        :meth:`patch_areas_by_fault` / :meth:`save_patch_areas`.  The merged
-        patch order is strand 0's triangles, then strand 1's, ... so it matches
-        the SS/DS parameter ordering the inversion produces.
-        """
+    def merge(cls, faults):
         faults = list(faults)
-        V_parts, T_parts, L_parts, F_parts, lines = [], [], [], [], []
+        V_parts, T_parts, L_parts, F_parts, n_parts = [], [], [], [], []
         voff = 0
         for k, f in enumerate(faults):
             V_parts.append(f.vertices)
@@ -111,39 +52,76 @@ class FaultTriangles:
             L_parts.append(f.layers if f.layers is not None
                            else np.zeros(f.n_patches, dtype=int))
             F_parts.append(np.full(f.n_patches, k, dtype=int))
-            lines.extend(f._component_lines())
+            n_parts.append(f.name)
         obj = cls(np.vstack(V_parts), np.vstack(T_parts),
-                  layers=np.concatenate(L_parts), datum=faults[0].datum,
-                  name=name, nu=faults[0].nu)
+                  layers=np.concatenate(L_parts),nu=faults[0].nu)
         obj.fault_ids = np.concatenate(F_parts)
-        obj.component_names = [f.name for f in faults]
-        obj._trace_lines = lines
+        obj.subfault_names = {k: name for k, name in enumerate(n_parts)}
         return obj
 
+
+    ####    GOCAD TSurf I/O    ####
     @classmethod
-    def from_npz(cls, path, nu=0.25):
-        """Build directly from a ``remeshFault`` ``.npz`` (no remeshFault import).
+    def from_gocad(cls, path, name=None):
+        """Read a GOCAD TSurf .txt (z-up elevation). Vertices are kept as-is."""
+        verts, tris = {}, []
+        with open(path) as fh:
+            for line in fh:
+                parts = line.split()
+                if not parts:
+                    continue
+                if parts[0] in ("VRTX", "PVRTX"):
+                    verts[int(parts[1])] = [float(p) for p in parts[2:5]]
+                elif parts[0] == "TRGL":
+                    tris.append([int(p) for p in parts[1:4]])
+        ids = sorted(verts)                     # GOCAD ids may be 1-based/sparse
+        index = {vid: i for i, vid in enumerate(ids)}
+        vertices = np.array([verts[vid] for vid in ids])
+        triangles = np.array([[index[i] for i in t] for t in tris])
+        return cls(vertices, triangles, name=name or Path(path).stem)
 
-        Keys: ``vertices`` (V,3), ``triangles`` (T,3 int, 0-based, wound),
-        ``layers`` (T,), ``depths``, ``datum``, ``name``, ``winding_ref``.
-        """
-        d = np.load(path, allow_pickle=True)
-        wref = d["winding_ref"] if "winding_ref" in d.files else None
-        if wref is not None and np.isnan(np.asarray(wref, float)).any():
-            wref = None
-        return cls(d["vertices"], d["triangles"],
-                   layers=d["layers"] if "layers" in d.files else None,
-                   datum=float(d["datum"]) if "datum" in d.files else 0.0,
-                   name=str(d["name"]) if "name" in d.files else "fault_triangles",
-                   nu=nu, winding_ref=wref)
+    def write_gocad(self, path):
+        """Write the mesh as a GOCAD TSurf .txt (ZPOSITIVE Elevation)."""
+        lines = [
+            "GOCAD TSurf 1",
+            "HEADER {",
+            f"name:{self.name}",
+            "*visible:true",
+            "}",
+            "GOCAD_ORIGINAL_COORDINATE_SYSTEM",
+            "NAME Default",
+            'AXIS_NAME "X" "Y" "Z"',
+            'AXIS_UNIT "m" "m" "m"',
+            "ZPOSITIVE Elevation",
+            "END_ORIGINAL_COORDINATE_SYSTEM",
+            "TFACE",
+        ]
+        for i, (x, y, z) in enumerate(self.vertices, start=1):
+            lines.append(f"VRTX {i} {x:.6f} {y:.6f} {z:.6f}")
+        for a, b, c in self.triangles + 1:      # GOCAD is 1-based
+            lines.append(f"TRGL {a} {b} {c}")
+        lines.append("END")
+        Path(path).write_text("\n".join(lines) + "\n")
+        return self
 
-    # ------------------------------------------------------------------ #
-    #  Geometry accessors (vectorised over triangles)
-    # ------------------------------------------------------------------ #
+    def save(self, path):
+        """Save as <path>.pickle (full object) and <path>.txt (GOCAD, geometry only)."""
+        path = Path(path)
+        with open(path.with_suffix(".pickle"), "wb") as fh:
+            pickle.dump(self, fh)
+        self.write_gocad(path.with_suffix(".txt"))
+        return self
+
+
+    ####   Basic triangle geometry    ####
     @property
     def n_patches(self):
         return len(self.triangles)
-
+    
+    @property
+    def n_subfaults(self):
+        return len(np.unique(self.fault_ids))
+    
     def triangle_xyz(self, i):
         """(3, 3) vertices of triangle ``i``, z-up frame (rows are x, y, z)."""
         return self.vertices[self.triangles[i]]
@@ -166,87 +144,40 @@ class FaultTriangles:
         """(T,) mean depth, positive-down (metres below datum)."""
         return -self.vertices[self.triangles][:, :, 2].mean(axis=1)
 
-    def initializeslip(self, value=0.0):
-        """Reset ``self.slips`` (mirrors the CSI/Fault3d entry point)."""
-        self.slips = np.full(len(self.triangles), float(value))
-        return self
 
-    # ------------------------------------------------------------------ #
-    #  Surface trace (for downsampling / station filtering / plots)
-    # ------------------------------------------------------------------ #
-    def surface_trace_xy(self, tol=1.0):
-        """(M, 2) top-contour vertices (UTM), ordered along strike.
-
-        The remesh cuts horizontal contours, so the shallowest contour is the
-        set of vertices at the maximum z (a single value); we select them and
-        order them by their projection onto the trace's principal (strike) axis.
-        """
-        z = self.vertices[:, 2]
-        top = z > (z.max() - tol)
-        pts = self.vertices[top][:, :2]
-        if len(pts) < 2:
-            return pts
-        c = pts - pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(c, full_matrices=False)
-        order = np.argsort(c @ vt[0])
-        return pts[order]
-
-    def _component_lines(self):
-        """List of per-strand trace polylines (one entry for a single mesh)."""
-        if self._trace_lines is not None:
-            return list(self._trace_lines)
-        return [self.surface_trace_xy()]
-
+    #### Surface trace GeoDataFrame (the .trace interface InSAR/InversionManager expect)
     @property
     def trace(self):
-        """GeoDataFrame of the surface trace(s) in UTM (EPSG:32611).
+        return self.get_surface_trace_xy()
 
-        One row per strand; geometry is a ``LineString`` of the top-contour
-        vertices.  Matches the ``.trace`` duck-typing that ``InSAR``/``GNSS``/
-        ``InversionManager`` expect (``.geometry`` iterable / ``.unary_union``).
-        """
+    def get_surface_trace_xy(self, tol=1.0):
         import geopandas as gpd
         from shapely.geometry import LineString
-        geoms = [LineString(l) for l in self._component_lines() if len(l) >= 2]
-        return gpd.GeoDataFrame({"id": list(range(len(geoms)))},
-                                geometry=geoms, crs="EPSG:32611")
+        geoms = []
+        for i in range(self.n_subfaults):
+            vertices = self.vertices[self.triangles[self.fault_ids == i]].reshape(-1, 3)
+            z = vertices[:, 2]
+            top = z > (z.max() - tol)
+            pts = vertices[top][:, :2]
+            c = pts - pts.mean(axis=0)
+            _, _, vt = np.linalg.svd(c, full_matrices=False)
+            order = np.argsort(c @ vt[0])
+            linestring = LineString(pts[order])
+            geoms.append(linestring)
+        gdf = gpd.GeoDataFrame({"id": list(range(len(geoms)))}, geometry=geoms)
+        return gdf
 
-    # ------------------------------------------------------------------ #
-    #  Per-fault patch areas (for AlTar moment / smoothing priors)
-    # ------------------------------------------------------------------ #
-    def patch_areas_by_fault(self):
-        """Dict ``{strand_name: (n_k,) areas}`` split by ``fault_ids``."""
-        a = self.areas
-        return {name: a[self.fault_ids == k]
-                for k, name in enumerate(self.component_names)}
 
+    ####    Save patch areas for AlTar inversion    ####
     def save_patch_areas(self, path):
-        """Write patch areas (m^2) to an HDF5 file for the AlTar inversion.
-
-        ``/patch_areas`` holds all areas in GF/parameter order; ``/by_fault/<name>``
-        holds each strand's block (same order as the merged patches).
-        """
         import h5py
         with h5py.File(path, "w") as fh:
             fh.create_dataset("patch_areas", data=self.areas)
-            grp = fh.create_group("by_fault")
-            for name, ar in self.patch_areas_by_fault().items():
-                grp.create_dataset(str(name), data=ar)
         return self
 
-    # ------------------------------------------------------------------ #
-    #  Dip-slip sign convention
-    # ------------------------------------------------------------------ #
+    ####    Meade07 normals and dip-slip reference   ####
     def forced_up_normals(self):
-        """(T, 3) unit element normals in meade07's frame (depth positive-down),
-        each forced to point +z exactly as ``meade07`` does internally.
-
-        This is the vector whose horizontal azimuth sets each element's
-        strike/dip decomposition.  For a near-vertical fault it is ~horizontal
-        and points to one side of the fault; where the dip azimuth reverses
-        along strike (or the element is within a degree or two of vertical, so
-        the ``normVec[2] < 0`` test is numerical noise) it flips side, which is
-        what makes the raw dip-slip sense inconsistent patch-to-patch.
+        """Return the normal to each triangle, forced to point +z (depth positive-down) per Meade 2007.
         """
         v = self.vertices[self.triangles].astype(float).copy()
         v[:, :, 2] *= -1.0                          # z-up -> depth positive-down
@@ -289,7 +220,7 @@ class FaultTriangles:
 
         ref = np.zeros((self.n_patches, 3))
         if isinstance(dip_normals, dict):
-            name_to_id = {nm: k for k, nm in enumerate(self.component_names)}
+            name_to_id = {nm: k for k, nm in enumerate(self.subfault_names)}
             for key, vec in dip_normals.items():
                 k = name_to_id.get(key, key)        # accept strand name or int id
                 ref[self.fault_ids == k] = to_meade(vec)
@@ -299,23 +230,13 @@ class FaultTriangles:
             return np.tile(to_meade(arr), (self.n_patches, 1))
         return np.array([to_meade(arr[k]) for k in self.fault_ids])  # (n_strands,3)
 
-    def set_dip_convention(self, dip_normals):
-        """Store per-strand reference normals so subsequent
-        :meth:`compute_greens_functions` calls (including the ones made inside
-        ``InSAR``/``GNSS.compute_greens_functions``) fix a consistent dip-slip
-        sense.  See :meth:`compute_greens_functions` for the accepted forms.
-        Returns ``self``.
-        """
-        self.dip_reference = dip_normals
-        return self
-
     # ------------------------------------------------------------------ #
     #  Green's functions
     # ------------------------------------------------------------------ #
-    def compute_greens_functions(self, pts, verbose=False, dip_normals=None):
+    def compute_greens_functions(self, pts, verbose=False, dip_normals="auto"):
         """Meade (2007) surface-displacement Green's functions per triangle.
 
-        Parameters
+        Args
         ----------
         pts : array-like, shape (2, n_pts) or (3, n_pts)
             Observation coordinates; row 0 = easting, row 1 = northing (metres,
@@ -323,28 +244,15 @@ class FaultTriangles:
             (positive-down); omitted -> surface (z = 0), as for InSAR/GNSS.
         verbose : bool
             Print a progress line every ~50 triangles.
-        dip_normals : optional
-            Per-strand reference normal(s) that fix a *consistent* positive
-            dip-slip sense.  Without this (and without a stored
-            :meth:`set_dip_convention`), meade07's per-element forced-up normal
-            sets the DS sense, which flips where a strand's dip azimuth reverses
-            along strike or where elements are near-vertical -- so a single "+DS"
-            parameter does not mean one physical thing across the mesh.  Given a
-            reference, each patch's DS Green's function is negated where its
-            forced-up normal points to the opposite side (``forced_up_normal .
-            ref < 0``), so "+DS" is uniform per strand.  **Strike-slip is never
-            touched.**  Accepted forms (z-up frame):  ``"auto"`` (each strand's
-            mean forced-up normal), a single ``(3,)`` vector, an
-            ``(n_strands, 3)`` array by ``fault_ids``, or a ``dict``
-            ``{strand_name or id: (3,)}``.  Falls back to
-            :attr:`dip_reference` (set via :meth:`set_dip_convention`) when this
-            argument is ``None``; pass a value here to override it.
+        dip_normals :
+            Enforces a positive dip-slip sense. See _resolve_dip_reference. 
 
         Returns
         -------
         self, with ``self.gfs`` of shape ``(2, n_patches, 3, n_pts)``:
         axis 0 = [strike-slip, dip-slip], axis 2 = [east, north, up].
         """
+        _self = self._copy()  # avoid overwriting the original if we need to re-run
         pts = np.asarray(pts, dtype=float)
         sx = pts[0]
         sy = pts[1]
@@ -352,24 +260,24 @@ class FaultTriangles:
         sz = pts[2] if pts.shape[0] > 2 else np.zeros_like(sx)
 
         n_pts = sx.shape[0]
-        n_tri = self.n_patches
+        n_tri = _self.n_patches
         gfs_ss = np.zeros((n_tri, 3, n_pts))
         gfs_ds = np.zeros((n_tri, 3, n_pts))
 
         for i in range(n_tri):
-            v = self.triangle_xyz(i)
+            v = _self.triangle_xyz(i)
             # z-up (z<=0) -> depth positive-down for meade07.
             verts = [np.array([p[0], p[1], -p[2]]) for p in v]
 
             # Strike-slip: meade07's ss is -Okada U1, so negate to match
             # the Fault3d/Okada convention.  displacement() returns (E, N, Up).
             ux, uy, uz = meade07.displacement(sx, sy, sz, [p.copy() for p in verts],
-                                              1.0, 0.0, 0.0, nu=self.nu)
+                                              1.0, 0.0, 0.0, nu=_self.nu)
             gfs_ss[i] = -np.vstack((ux, uy, uz))
 
             # Dip-slip: meade07's ds already matches Okada U2.
             ux, uy, uz = meade07.displacement(sx, sy, sz, [p.copy() for p in verts],
-                                              0.0, 1.0, 0.0, nu=self.nu)
+                                              0.0, 1.0, 0.0, nu=_self.nu)
             gfs_ds[i] = np.vstack((ux, uy, uz))
 
             if verbose and (i % 50 == 0):
@@ -377,13 +285,10 @@ class FaultTriangles:
 
         # Optional consistent dip-slip sense: negate the DS GF (only) on patches
         # whose meade07 forced-up normal points to the opposite side of the
-        # supplied reference.  Linearity means -GF(+1 DS) == GF(-1 DS), i.e. slip
-        # down the reversed dip -- a valid physical field, just relabelled so
-        # "+DS" is uniform.  Strike-slip is left completely untouched.
-        ref = self._resolve_dip_reference(
-            dip_normals if dip_normals is not None else self.dip_reference)
+        # supplied reference.  Strike-slip is left completely untouched.
+        ref = _self._resolve_dip_reference(dip_normals)
         if ref is not None:
-            fup = self.forced_up_normals()
+            fup = _self.forced_up_normals()
             dots = np.einsum("ij,ij->i", fup, ref)
             rn = np.linalg.norm(ref, axis=1)          # ref rows may be non-unit
             valid = rn > 0                            # zero row = strand left as-is
@@ -399,8 +304,8 @@ class FaultTriangles:
             signs[valid] = np.where(dots[valid] >= 0.0, 1.0, -1.0)
             gfs_ds *= signs[:, None, None]
 
-        self.gfs = np.stack([gfs_ss, gfs_ds], axis=0)  # (2, n_tri, 3, n_pts)
-        return self
+        _self.gfs = np.stack([gfs_ss, gfs_ds], axis=0)  # (2, n_tri, 3, n_pts)
+        return _self
 
     # ------------------------------------------------------------------ #
     #  Plotting
@@ -512,8 +417,10 @@ class FaultTriangles:
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
         cmap_obj = plt.get_cmap(cmap)
 
-        lines = self._component_lines()
-        n = len(self.component_names)
+        # lines = self._component_lines()
+        trace = self.get_surface_trace_xy()
+        lines = [np.asarray(geom.coords) for geom in trace.geometry]
+        n = len(self.subfault_names)
         tri_xyz = self.vertices[self.triangles]          # (T, 3, 3), z-up
 
         # Project each strand onto its trace-defined vertical section first, so
@@ -567,7 +474,7 @@ class FaultTriangles:
             if not ax.yaxis_inverted():
                 ax.invert_yaxis()                        # surface at top
             ax.set_xlabel(f"Along strike ({units})")
-            ax.set_title(str(self.component_names[k]))
+            ax.set_title(str(self.subfault_names[k]))
         axes[0].set_ylabel(f"Depth ({units})")
 
         sm = ScalarMappable(cmap=cmap_obj, norm=norm)
@@ -590,4 +497,4 @@ class FaultTriangles:
 
     def __repr__(self):
         return (f"FaultTriangles(name={self.name!r}, {self.n_patches} triangles, "
-                f"{len(self.vertices)} vertices, datum={self.datum:.1f} m)")
+                f"{len(self.vertices)} vertices)")

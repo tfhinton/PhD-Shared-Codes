@@ -423,7 +423,7 @@ class InSAR:
         block are averaged to yield one downsampled observation.
 
         Args:
-            faults: A Fault3d object or list thereof.  Each must expose a .trace
+            faults: A Fault3d object or list thereof.  Each must expose a .get_surface_trace_xy()
                     GeoDataFrame with line geometry in the same CRS as the InSAR data.
 
         Kwargs:
@@ -443,7 +443,7 @@ class InSAR:
             faults = [faults]
 
         # Merge all fault trace geometries into a single shapely geometry
-        fault_geom = unary_union([f.trace.geometry.unary_union for f in faults])
+        fault_geom = unary_union([f.get_surface_trace_xy().geometry.unary_union for f in faults])
 
         # Estimate pixel spacing from a small probe subset
         n_probe      = min(1000, len(self.x))
@@ -575,7 +575,7 @@ class InSAR:
             ax (Axes or None): Axes to plot on; new figure created if None.
             cmap: Matplotlib colormap.
             title (str): Axes title.
-            fault: Fault3d object with a .trace GeoDataFrame (UTM CRS), or None.
+            fault: Fault3d object with a .get_surface_trace_xy() GeoDataFrame (UTM CRS), or None.
             vlim (tuple): (vmin, vmax) colour limits; auto-scaled if None.
             arrows (bool): Overlay quiver arrows showing the horizontal projection
                 of the LOS displacement vector (vel * [east, north]).  Default False.
@@ -599,7 +599,7 @@ class InSAR:
         plt.colorbar(sc, ax=ax, label='LOS displacement (m)', shrink=0.8)
 
         if fault is not None and hasattr(fault, 'trace'):
-            for geom in fault.trace.geometry:
+            for geom in fault.get_surface_trace_xy().geometry:
                 lines = [geom] if isinstance(geom, LineString) else list(geom.geoms)
                 for line in lines:
                     coords = np.array(line.coords)
