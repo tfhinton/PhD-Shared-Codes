@@ -43,7 +43,8 @@ class HamiltonianInversion:
     def _print(self, *args, **kwargs):
         if self.verbose: print(*args, **kwargs)
     
-    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, cores=None, timeout_minutes=30, progressbar=False):
+    def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, cores=None,
+            timeout_minutes=30, progressbar=False, init='auto', initvals=None):
         _self = self._copy()
         _self._print("Starting inversion...")
 
@@ -121,6 +122,8 @@ class HamiltonianInversion:
                 return_inferencedata=True,
                 progressbar=True,
                 callback=_timeout_callback,
+                init=init,          # 'auto' (jitter+adapt_diag) unless overridden
+                initvals=initvals,  # e.g. per-chain dicts for dispersed multimodal starts
             )
             _self._print(f"Sampling done in {(time.time() - _t0) / 60:.1f} min.")
         

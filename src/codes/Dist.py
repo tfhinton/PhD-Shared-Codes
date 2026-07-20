@@ -1,9 +1,18 @@
 import pymc as pm
 
 class GaussianDist:
-    def __init__(self, mu, sigma):
-        self.val = mu
+    def __init__(self, label, mu, sigma):
+        self.label = label
+        self.mu = mu
         self.sigma = sigma
+
+    @property
+    def val(self):
+        return self.mu
+
+    @property
+    def pm(self):
+        return pm.Normal(self.label, mu=self.mu, sigma=self.sigma)
 
 class UniformDist:
     def __init__(self, label, lower, upper):
