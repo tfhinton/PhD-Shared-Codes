@@ -1,6 +1,7 @@
 from .OpticalData import OpticalData
 from .Profile import Profile
 from .TwoDDzForwardModel import TwoDDzForwardModel
+from .TwoDDzSheathForwardModel import TwoDDzSheathForwardModel
 from .TwoDHomogeneousForwardModel import TwoDHomogeneousForwardModel
 from .Patch import PatchTwoD
 from .Dist import UniformDist, GaussianDist
@@ -16,4 +17,4 @@ from .FaultTriangles import FaultTriangles
 from .InSAR import InSAR
 from .GNSS import GNSS
 
-__all__ = ["OpticalData", "Profile", "TwoDDzForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "FaultRects", "Patch", "Cell", "compute_okada", "FaultTriangles", "InSAR", "GNSS"]
+__all__ = ["OpticalData", "Profile", "TwoDDzForwardModel", "TwoDDzSheathForwardModel", "TwoDHomogeneousForwardModel", "LeastSquaresInversion", "PatchTwoD", "UniformDist", "GaussianDist", "HamiltonianInversion", "InversionManager", "AltarOutput", "CSIWrapper", "utils", "Styles", "FaultRects", "Patch", "Cell", "compute_okada", "FaultTriangles", "InSAR", "GNSS"]
