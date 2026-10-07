@@ -184,10 +184,13 @@ class AltarOutput:
             ss = np.hstack([self.ps[k] for k in self.ss_keys])
             ds = np.hstack([self.ps[k] for k in self.ds_keys])
             tot = np.hypot(ss, ds)
+            print(ss.shape)
+            print(self.fault.n_patches)
             assert ss.shape[1] == self.fault.n_patches, (ss.shape, self.fault.n_patches)
             self._summ = dict(
                 ss_mode=_kde_mode(ss, self.seed), ds_mode=_kde_mode(ds, self.seed),
                 tot_mode=_kde_mode(tot, self.seed),
+                ss_mean=ss.mean(axis=0), ds_mean=ds.mean(axis=0), tot_mean=tot.mean(axis=0),
                 ss_std=ss.std(axis=0), ds_std=ds.std(axis=0), tot_std=tot.std(axis=0),
                 ss=ss, ds=ds, tot=tot)
         return self._summ
@@ -291,25 +294,25 @@ class AltarOutput:
     #  2D / 3D slip coloured by posterior mode
     # --------------------------------------------------------------------- #
     def plot_slip_2d(self, component="total", path=None, cmap=None,
-                     vmin=None, vmax=None):
+                     vmin=None, vmax=None, suffix="_mode"):
         if component == "total":
-            vals, label = self.summ["tot_mode"], "Total slip (m)"
+            vals, label = self.summ[f"tot{suffix}"], "Total slip (m)"
             cmap = cmap or SLIP_CMAP
             vmin = 0. if vmin is None else vmin
             vmax = float(vals.max()) if vmax is None else vmax
-            default = "slip2d_total.png"
+            default = f"slip2d_total{suffix}.png"
         elif component == "strikeslip":
-            vals, label = np.abs(self.summ["ss_mode"]), "|Strike-slip| (m)"
+            vals, label = np.abs(self.summ[f"ss{suffix}"]), "|Strike-slip| (m)"
             cmap = cmap or SLIP_CMAP
             vmin = 0. if vmin is None else vmin
-            default = "slip2d_strikeslip.png"
+            default = f"slip2d_strikeslip{suffix}.png"
         elif component == "dipslip":
-            vals, label = self.summ["ds_mode"], "Dip-slip (m)"
+            vals, label = self.summ[f"ds{suffix}"], "Dip-slip (m)"
             cmap = cmap or cmc.vik
             if vmin is None and vmax is None:
                 lim = float(np.abs(vals).max()) or 1e-3
                 vmin, vmax = -lim, lim
-            default = "slip2d_dipslip.png"
+            default = f"slip2d_dipslip{suffix}.png"
         else:
             raise ValueError(component)
         fig, _ = self.fault.plot_slip_2d(slip=vals, cmap=cmap, vmin=vmin, vmax=vmax,
@@ -317,15 +320,15 @@ class AltarOutput:
         fig.suptitle("Posterior mode (per-patch KDE maximum)", fontsize=11)
         self._save(fig, self._path(path, default))
 
-    def plot_slip_3d(self, path=None):
-        vals = self.summ["tot_mode"]
+    def plot_slip_3d(self, path=None, suffix="_mode"):
+        vals = self.summ[f"tot{suffix}"]
         self.fault.slips = vals
         fig, ax = self.fault.plot_fault3d(color_by="slip", cmap=SLIP_CMAP, vmin=0.,
                                           vmax=float(vals.max()), edgecolor="0.4",
                                           linewidth=0.15)
         ax.set_title("Total slip, posterior mode")
         self.fault.slips = np.zeros(self.fault.n_patches)
-        self._save(fig, self._path(path, "slip3d_total.png"))
+        self._save(fig, self._path(path, f"slip3d_total{suffix}.png"))
 
     # --------------------------------------------------------------------- #
     #  Bivariate slip / uncertainty with the wedge colorbar
@@ -901,7 +904,7 @@ class AltarOutput:
 
     def plot_moment_magnitude(self, path=None, mu=MU):
         """Posterior of moment magnitude, total and per strand."""
-        areas = self.fault.areas
+        areas = self.fault.areas * 1e6
         m0_strand = {}
         for k in range(self.fault.n_subfaults):
             m = self.fault.fault_ids == k

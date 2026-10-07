@@ -28,13 +28,19 @@ from ..FaultTriangles import FaultTriangles
 
 
 ####    Building a FaultTriangles from a community fault model    ####
-def fault_from_cfm(path, name=None):
+def fault_from_cfm(path, name=None, datum=None):
     """Read a CFM GOCAD TSurf and shift z so the top-trace datum sits at 0.
 
     Depths passed to :func:`remesh_fault` are measured down from this datum.
+    ``datum`` overrides the automatic top-edge detection (elevation to treat
+    as z=0); useful for partly-buried strands where the mesh's own "top" edge
+    dips in and out of the ground and the boundary heuristic (dip < 45 deg,
+    upper half of the mesh's z-range) can't isolate the true surface trace --
+    pass the same datum as the strand it branches from instead.
     """
     fault = FaultTriangles.from_gocad(path, name=name)
-    datum = _top_datum(fault.vertices, fault.triangles)
+    if datum is None:
+        datum = _top_datum(fault.vertices, fault.triangles)
     fault.vertices[:, 2] -= datum
     print(f"[remesh] {fault.name}: datum (z=0) at elevation {datum:.1f} m")
     return fault

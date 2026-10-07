@@ -133,11 +133,11 @@ class FaultTriangles:
 
     @property
     def areas(self):
-        """(T,) triangle areas (m^2) = 0.5 |(v1-v0) x (v2-v0)|."""
+        """(T,) triangle areas (km^2) = 0.5 * |(v1-v0) x (v2-v0)| / 1e6"""
         v = self.vertices[self.triangles]
         a = v[:, 1] - v[:, 0]
         b = v[:, 2] - v[:, 0]
-        return 0.5 * np.linalg.norm(np.cross(a, b), axis=1)
+        return 0.5 * np.linalg.norm(np.cross(a, b), axis=1) / 1e6
 
     @property
     def depths(self):
@@ -169,10 +169,11 @@ class FaultTriangles:
 
 
     ####    Save patch areas for AlTar inversion    ####
-    def save_patch_areas(self, path):
-        import h5py
-        with h5py.File(path, "w") as fh:
-            fh.create_dataset("patch_areas", data=self.areas)
+    def save_patch_areas(self, path, slice=None, multiplier=1.0):
+        areas = self.areas
+        if slice is not None:
+            areas = areas[slice]
+        np.savetxt(path, areas * multiplier, fmt="%.6f")
         return self
 
     ####    Meade07 normals and dip-slip reference   ####

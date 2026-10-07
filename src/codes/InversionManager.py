@@ -374,6 +374,36 @@ class InversionManager:
         return self
 
 
+    ##  Inflate the assembled covariance matrix
+    def inflate_covariance(self, offset=0., multiplier=1.):
+
+        '''
+        Widen the assembled data covariance matrix Cd, e.g. to compensate for
+        under-estimated formal data uncertainties.
+
+            Cd <- multiplier * Cd + offset * I
+
+        Kwargs:
+            offset (float): Added to the diagonal (variance units, same as Cd).
+                Default 0. (no-op).
+            multiplier (float): Multiplies the whole matrix before the offset
+                is added. Default 1. (no-op).
+
+        Returns:
+            self (Cd modified in place)
+        '''
+
+        assert self.Cd is not None, "Call set_datasets() first."
+
+        if multiplier != 1.:
+            self.Cd = self.Cd * multiplier
+        if offset != 0.:
+            self.Cd = self.Cd + offset * np.eye(len(self.Cd))
+
+        self._print(f"Inflated Cd: multiplier={multiplier}, offset={offset}")
+        return self
+
+
     ##  Save assembled system to separate HDF5 files
     def save_to_hdf5(self, directory,
                      data_filename='data.h5',

@@ -8,7 +8,7 @@ import cmcrameri.cm as cmc
 import pyproj
 import scipy.optimize as sp_opt
 import scipy.spatial.distance as sp_dist
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
 from shapely.ops import unary_union
 
 
@@ -857,8 +857,15 @@ class OpticalData:
             ax.set_ylabel("Longitude (˚)")
 
             if fault is not None:
-                trace = fault.trace.to_crs("EPSG:4326")
-                trace.plot(ax=ax, color="black", linewidth=2.)
+                # fault.trace has no CRS assigned (naive UTM geometry), so
+                # reproject raw coords via this raster's CRS instead of
+                # GeoDataFrame.to_crs() -- same workaround as InSAR.plot().
+                for geom in fault.trace.geometry:
+                    lines = [geom] if isinstance(geom, LineString) else list(geom.geoms)
+                    for line in lines:
+                        coords = np.array(line.coords)
+                        lons_t, lats_t = _self._xy2ll(coords[:, 0], coords[:, 1])
+                        ax.plot(lons_t, lats_t, color="black", linewidth=2., zorder=4)
             if profiles is not None:
                 for p in profiles:
                     if profile_swathe_width is not None:

@@ -44,7 +44,13 @@ class HamiltonianInversion:
         if self.verbose: print(*args, **kwargs)
     
     def run(self, eps_val=1.e-3, draws=2000, tune=1000, target_accept=0.9, chains=4, cores=None,
-            timeout_minutes=30, progressbar=False, init='auto', initvals=None):
+            timeout_minutes=30, progressbar=False, init='auto', initvals=None, sampler='nuts',
+            random_seed=None):
+        '''sampler: 'nuts' (default, gradient-based via finite differences),
+        'smc' (pm.sample_smc: gradient-free sequential Monte Carlo, tempered from
+        prior to posterior; `draws` = particles per chain, tune/init/timeout
+        unused), or 'demz' (DEMetropolisZ: gradient-free differential-evolution
+        Metropolis; needs many more draws than NUTS).'''
         _self = self._copy()
         _self._print("Starting inversion...")
 
@@ -112,19 +118,33 @@ class HamiltonianInversion:
                          f"(draws={draws}, tune={tune}, timeout={timeout_minutes} min) ...")
             _t0 = time.time()
 
-            # Sample with NUTS (the HMC variant PyMC uses by default)
-            result = pm.sample(
-                draws=draws,
-                tune=tune,
-                target_accept=target_accept,   # increase for more complex posteriors
-                chains=chains,
-                cores=_cores,
-                return_inferencedata=True,
-                progressbar=True,
-                callback=_timeout_callback,
-                init=init,          # 'auto' (jitter+adapt_diag) unless overridden
-                initvals=initvals,  # e.g. per-chain dicts for dispersed multimodal starts
-            )
+            if sampler == 'smc':
+                result = pm.sample_smc(draws=draws, chains=chains, cores=_cores,
+                                       random_seed=random_seed, progressbar=True)
+            elif sampler == 'demz':
+                result = pm.sample(
+                    draws=draws, tune=tune, chains=chains, cores=_cores,
+                    step=pm.DEMetropolisZ(), initvals=initvals,
+                    return_inferencedata=True, progressbar=True,
+                    callback=_timeout_callback, random_seed=random_seed,
+                )
+            elif sampler == 'nuts':
+                # Sample with NUTS (the HMC variant PyMC uses by default)
+                result = pm.sample(
+                    draws=draws,
+                    tune=tune,
+                    target_accept=target_accept,   # increase for more complex posteriors
+                    chains=chains,
+                    cores=_cores,
+                    return_inferencedata=True,
+                    progressbar=True,
+                    callback=_timeout_callback,
+                    init=init,          # 'auto' (jitter+adapt_diag) unless overridden
+                    initvals=initvals,  # e.g. per-chain dicts for dispersed multimodal starts
+                    random_seed=random_seed,
+                )
+            else:
+                raise ValueError(f'unknown sampler {sampler!r}')
             _self._print(f"Sampling done in {(time.time() - _t0) / 60:.1f} min.")
         
         # posterior predictive (linearized)

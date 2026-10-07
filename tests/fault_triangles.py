@@ -19,9 +19,9 @@ print(fault.gfs)
 north_ss_gfs = fault.gfs[0, :, 1, :]
 north_ss_gfs = np.sum(north_ss_gfs, axis=0)
 
-fig, ax = plt.subplots(figsize=(8, 6))
-im = ax.imshow(north_ss_gfs.reshape(xx.shape), extent=[xs.min(), xs.max(), ys.min(), ys.max()], origin="lower", cmap=cmc.vik, interpolation="bilinear")
-plt.show()
+# fig, ax = plt.subplots(figsize=(8, 6))
+# im = ax.imshow(north_ss_gfs.reshape(xx.shape), extent=[xs.min(), xs.max(), ys.min(), ys.max()], origin="lower", cmap=cmc.vik, interpolation="bilinear")
+# plt.show()
 
 fault.plot_fault3d(color_by="layer", cmap=cmc.tokyo)
 plt.show()
