@@ -57,6 +57,11 @@ class FaultTriangles:
                   layers=np.concatenate(L_parts),nu=faults[0].nu)
         obj.fault_ids = np.concatenate(F_parts)
         obj.subfault_names = {k: name for k, name in enumerate(n_parts)}
+        # Keep supplied traces only if every part has one (else fall back to mesh-derived)
+        traces = [getattr(f, "_trace", None) for f in faults]
+        if all(t is not None for t in traces):
+            import pandas as pd
+            obj.trace = pd.concat(traces, ignore_index=True).assign(id=lambda d: range(len(d)))
         return obj
 
 
@@ -148,7 +153,63 @@ class FaultTriangles:
     #### Surface trace GeoDataFrame (the .trace interface InSAR/InversionManager expect)
     @property
     def trace(self):
-        return self.get_surface_trace_xy()
+        """User-supplied trace if set (see `import_trace`), else derived from the mesh."""
+        supplied = getattr(self, "_trace", None)   # getattr: pickles predating _trace
+        return supplied if supplied is not None else self.get_surface_trace_xy()
+
+    @trace.setter
+    def trace(self, gdf):
+        """Set a GeoDataFrame trace (one LineString per subfault); None restores the default."""
+        self._trace = gdf
+
+    def import_trace(self, path, crs=None, sort_by="id", layer=None):
+        """Load a surface trace drawn in e.g. QGIS (.shp, .gpkg, .geojson, ...).
+
+        The trace must be in the same projected (metre) frame as ``self.vertices``.
+        If ``crs`` is given (e.g. "EPSG:32611") the file is reprojected to it.
+        MultiLineStrings are exploded, Z is dropped, and features are ordered by
+        ``sort_by`` (if that column exists) so row i should correspond to subfault i.
+        """
+        import warnings
+        import geopandas as gpd
+        from shapely import force_2d
+
+        gdf = gpd.read_file(path, layer=layer)
+        if crs is not None:
+            if gdf.crs is None:
+                gdf = gdf.set_crs(crs)
+            else:
+                gdf = gdf.to_crs(crs)
+        elif gdf.crs is not None and gdf.crs.is_geographic:
+            raise ValueError(f"{path} is in geographic CRS {gdf.crs}; pass crs= "
+                             "(the mesh's projected CRS, e.g. 'EPSG:32611') to reproject.")
+
+        if sort_by is not None and sort_by in gdf.columns:
+            gdf = gdf.sort_values(sort_by)
+        gdf = gdf.explode(index_parts=False)
+        gdf = gdf[gdf.geometry.geom_type == "LineString"]
+        gdf = gdf.set_geometry(force_2d(gdf.geometry.values))
+        gdf = gdf.reset_index(drop=True)
+        gdf["id"] = range(len(gdf))
+
+        if len(gdf) != self.n_subfaults:
+            warnings.warn(f"Imported trace has {len(gdf)} line(s) but fault has "
+                          f"{self.n_subfaults} subfault(s); trace rows index subfaults.")
+        self.trace = gdf
+        return self
+
+    def export_trace(self, path, crs=None, from_mesh=False):
+        """Write the trace to a vector file for QGIS (format from extension: .shp, .gpkg, ...).
+
+        Exports ``self.trace`` (the supplied trace if set), or the mesh-derived trace
+        if ``from_mesh``. The mesh-derived trace carries no CRS, so pass ``crs``
+        (the mesh's projected CRS, e.g. "EPSG:32611") for it to georeference in QGIS.
+        """
+        gdf = self.get_surface_trace_xy() if from_mesh else self.trace
+        if crs is not None:
+            gdf = gdf.set_crs(crs) if gdf.crs is None else gdf.to_crs(crs)
+        gdf.to_file(path)
+        return self
 
     def get_surface_trace_xy(self, tol=1.0):
         import geopandas as gpd
@@ -166,6 +227,153 @@ class FaultTriangles:
             geoms.append(linestring)
         gdf = gpd.GeoDataFrame({"id": list(range(len(geoms)))}, geometry=geoms)
         return gdf
+
+    def refine_trace(self, strain, half_width=100., along_spacing=5., offset_spacing=1.,
+                     smooth_length=50., jump_penalty=0.1, max_jump=3., min_ridge_ratio=5.,
+                     min_clear_length=100., keep_input_trace=None):
+        """Move ``self.trace`` onto the ridge of fault-parallel shear strain.
+
+        For each subfault:
+          1. Resample the trace every ``along_spacing`` m and smooth it lightly
+             (Gaussian, ``smooth_length`` m) to give a base line with a strike
+             and a fault-normal direction at every sample.
+          2. Assign each strain pixel to its nearest base-line sample, and give it
+             an offset = its fault-normal distance from the base line.
+          3. Rotate the pixel's strain tensor into that sample's strike to get the
+             fault-parallel shear, e_tn = t . E . n.
+          4. Average e_tn in bins of (sample, offset) -> a "straightened" image of
+             |shear| with along-strike distance down the rows and offset across.
+          5. Pick one offset per row: the path through the image with the largest
+             summed shear, minus ``jump_penalty`` per metre the path steps sideways
+             between rows (see `_least_cost_path`).
+          6. Keep the picked offset only where the ridge is clear: shear on the
+             path >= ``min_ridge_ratio`` x the background (median of the image),
+             over a continuous stretch of at least ``min_clear_length`` m.
+             Elsewhere interpolate the offset linearly along strike between the
+             clear stretches, returning to zero (the input trace) at the two ends.
+             Sections listed in ``keep_input_trace`` are left on the input trace.
+          7. Refined trace = base line + offset along the fault normal.
+
+        Parameters
+        ----------
+        strain : dict of flat arrays x, y, exx, eyy, exy
+            Strain in the east-north frame on a corridor of points around the
+            trace, e.g. from `OpticalData.calculate_finite_strain(self.trace)`.
+        half_width : float
+            Largest offset searched either side of the trace (m).
+        along_spacing, offset_spacing : float
+            Bin sizes of the straightened image along and across strike (m).
+        smooth_length : float
+            Gaussian sigma smoothing the base line (m). Keeps the fault normals of
+            neighbouring samples from crossing at kinks in the trace.
+        jump_penalty : float
+            Cost per metre of sideways step between rows, as a fraction of the
+            typical ridge strain (median over rows of the row maximum).
+        max_jump : float
+            Largest sideways step allowed between neighbouring rows (m).
+        min_ridge_ratio : float
+            Shear on the path, relative to the background, needed for a row's
+            pick to be trusted.
+        min_clear_length : float
+            Shortest continuous stretch of trusted rows that is kept (m); shorter
+            ones are isolated noise or features crossing the fault.
+        keep_input_trace : dict {subfault index: [(start, stop), ...]} or None
+            Along-trace distance ranges (m) where the input trace is kept as it
+            is (offset zero), e.g. ``{0: [(42000., np.inf)]}``. The refined trace
+            simply steps onto the input trace at the edges of each range.
+
+        Returns
+        -------
+        list of dict, one per subfault, for plotting / checking:
+            along (R,), offsets (C,) : image axes (m)
+            image (R, C)             : straightened |shear| image
+            path_offset (R,)         : offset picked by the path per row (m)
+            path_strain (R,)         : image value on the path
+            clear (R,) bool          : rows where the pick was trusted
+            offset (R,)              : final offset per row (m)
+            base, refined (R, 2)     : base line and refined trace (x, y)
+
+        ``self.trace`` is replaced by the refined trace.
+        """
+        import shapely
+        from scipy.ndimage import gaussian_filter1d
+        from scipy.spatial import cKDTree
+
+        points = np.column_stack([strain["x"], strain["y"]])
+        offsets = np.arange(-half_width, half_width + offset_spacing / 2, offset_spacing)
+        n_cols = len(offsets)
+
+        diagnostics, refined_lines = [], []
+        for i, line in enumerate(self.trace.geometry):
+
+            # 1. Base line: resampled, smoothed trace with unit tangent and normal
+            along = np.arange(0., line.length, along_spacing)
+            base = shapely.get_coordinates(shapely.line_interpolate_point(line, along))
+            base = gaussian_filter1d(base, smooth_length / along_spacing, axis=0, mode="nearest")
+            tangent = np.gradient(base, axis=0)
+            tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
+            normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])   # 90 deg left of strike
+            n_rows = len(along)
+
+            # 2. Nearest base-line sample (row) and fault-normal offset of each pixel
+            near = np.all((points > base.min(axis=0) - half_width) &
+                          (points < base.max(axis=0) + half_width), axis=1)
+            _, row = cKDTree(base).query(points[near], workers=-1)
+            rel = points[near] - base[row]
+            offset = np.sum(rel * normal[row], axis=1)
+            col = np.round((offset + half_width) / offset_spacing).astype(int)
+            # drop pixels outside the search width or beyond the ends of the trace
+            keep = (col >= 0) & (col < n_cols) & \
+                   (np.abs(np.sum(rel * tangent[row], axis=1)) <= along_spacing)
+            row, col = row[keep], col[keep]
+
+            # 3. Fault-parallel shear strain, e_tn = t . E . n
+            tx, ty = tangent[row].T
+            nx, ny = normal[row].T
+            exx, eyy, exy = (strain[key][near][keep] for key in ("exx", "eyy", "exy"))
+            shear = tx * nx * exx + ty * ny * eyy + (tx * ny + ty * nx) * exy
+
+            # 4. Straightened image: mean shear in each (row, offset) bin
+            flat = row * n_cols + col
+            count = np.bincount(flat, minlength=n_rows * n_cols)
+            total = np.bincount(flat, weights=shear, minlength=n_rows * n_cols)
+            image = np.abs(total / np.maximum(count, 1)).reshape(n_rows, n_cols)   # empty bins -> 0
+            background = np.median(image[count.reshape(n_rows, n_cols) > 0])
+
+            # 5. Ridge path through the image
+            typical_ridge = np.median(image.max(axis=1))
+            path = _least_cost_path(image / typical_ridge,
+                                    jump_penalty * offset_spacing,
+                                    int(round(max_jump / offset_spacing)))
+
+            # 6. Trust the path only where the ridge is clear; interpolate elsewhere,
+            #    anchored to zero offset at both ends of the strand
+            path_offset = offsets[path]
+            path_strain = image[np.arange(n_rows), path]
+            clear = path_strain >= min_ridge_ratio * background
+            run_ends = np.flatnonzero(np.diff(np.r_[False, clear, False]))   # start, stop, start, ...
+            for start, stop in zip(run_ends[::2], run_ends[1::2]):
+                if (stop - start) * along_spacing < min_clear_length:
+                    clear[start:stop] = False
+            kept = np.zeros(n_rows, dtype=bool)
+            for start, stop in (keep_input_trace or {}).get(i, []):
+                kept |= (along >= start) & (along < stop)
+            clear &= ~kept
+            anchors = clear.copy()
+            anchors[[0, -1]] = True
+            offset = np.interp(along, along[anchors], np.where(clear, path_offset, 0.)[anchors])
+            offset[kept] = 0.
+
+            # 7. Refined trace
+            refined = base + offset[:, None] * normal
+            refined_lines.append(shapely.LineString(refined))
+            diagnostics.append(dict(along=along, offsets=offsets, image=image,
+                                    path_offset=path_offset, path_strain=path_strain,
+                                    clear=clear, offset=offset,
+                                    base=base, refined=refined))
+
+        self.trace = self.trace.set_geometry(refined_lines)
+        return diagnostics
 
 
     ####    Save patch areas for AlTar inversion    ####
@@ -499,3 +707,33 @@ class FaultTriangles:
     def __repr__(self):
         return (f"FaultTriangles(name={self.name!r}, {self.n_patches} triangles, "
                 f"{len(self.vertices)} vertices)")
+
+
+def _least_cost_path(score, jump_penalty, max_jump):
+    """One column per row of ``score`` (R, C), maximising the summed score minus
+    ``jump_penalty`` per column moved between neighbouring rows, with moves of at
+    most ``max_jump`` columns. Solved exactly by dynamic programming (Viterbi):
+    sweep down the rows keeping, for every column, the best total of any path
+    ending there; then walk back up from the best final column.
+    """
+    n_rows, n_cols = score.shape
+    cols = np.arange(n_cols)
+    jumps = np.arange(-max_jump, max_jump + 1)
+    prev_col = cols[None, :] - jumps[:, None]            # (J, C) column we would come from
+    allowed = (prev_col >= 0) & (prev_col < n_cols)
+    prev_col = np.clip(prev_col, 0, n_cols - 1)
+    penalty = jump_penalty * np.abs(jumps)[:, None]
+
+    best = score[0].copy()                               # best total of a path ending at each column
+    came_from = np.zeros((n_rows, n_cols), dtype=int)
+    for i in range(1, n_rows):
+        candidates = np.where(allowed, best[prev_col], -np.inf) - penalty
+        j = candidates.argmax(axis=0)
+        came_from[i] = prev_col[j, cols]
+        best = candidates[j, cols] + score[i]
+
+    path = np.empty(n_rows, dtype=int)
+    path[-1] = best.argmax()
+    for i in range(n_rows - 1, 0, -1):
+        path[i - 1] = came_from[i, path[i]]
+    return path

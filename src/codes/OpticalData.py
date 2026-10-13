@@ -8,6 +8,7 @@ import cmcrameri.cm as cmc
 import pyproj
 import scipy.optimize as sp_opt
 import scipy.spatial.distance as sp_dist
+from scipy.ndimage import gaussian_filter
 from shapely.geometry import Point, LineString
 from shapely.ops import unary_union
 
@@ -437,6 +438,111 @@ class OpticalData:
                       for xi, yi in zip(self.x, self.y)])
         self._keep_pixels(np.flatnonzero(d > distance))
         self._print(f"  After fault rejection ({distance} m): {len(self.x)} pixels")
+
+
+    ## Gaussian smoothing that ignores NaNs (and leaves them as NaN)
+    @staticmethod
+    def _smooth_ignoring_nan(arr, sigma):
+        valid = np.isfinite(arr)
+        if sigma == 0:
+            return arr
+        total  = gaussian_filter(np.where(valid, arr, 0.), sigma)
+        weight = gaussian_filter(valid.astype(float), sigma)
+        return np.where(valid, total / np.maximum(weight, 1e-6), np.nan)
+
+
+    ## Green-Cauchy finite strain on a corridor of pixels around a fault trace
+    def calculate_finite_strain(self, trace, half_width=100., smooth_sigma=2., tile_size=500):
+
+        '''
+        Green-Cauchy (Green-Lagrange) finite strain at every pixel within half_width
+        of a fault trace.
+
+        With u = EW and v = NS displacement, and x = east, y = north:
+            exx = du/dx + ( (du/dx)^2 + (dv/dx)^2 ) / 2
+            eyy = dv/dy + ( (du/dy)^2 + (dv/dy)^2 ) / 2
+            exy = ( du/dy + dv/dx + du/dx du/dy + dv/dx dv/dy ) / 2
+
+        The raster is processed in square tiles and only tiles touching the corridor
+        are read, so this is cheap on the full (lazily loaded) scene. Exact zeros are
+        treated as nodata.
+
+        Args:
+            trace: GeoDataFrame / GeoSeries (e.g. fault.trace) or shapely geometry,
+                in the raster CRS.
+
+        Kwargs:
+            half_width (float): corridor half-width either side of the trace (m).
+            smooth_sigma (float): Gaussian smoothing of EW and NS before
+                differentiating (pixels). 0 for none.
+            tile_size (int): tile side length (pixels).
+
+        Returns:
+            dict of flat arrays, one entry per corridor pixel:
+                x, y (pixel centres), exx, eyy, exy (strain in the east-north frame).
+        '''
+        from rasterio.features import geometry_mask
+        from shapely.geometry import box
+
+        if hasattr(trace, "geometry"):
+            trace = unary_union(list(trace.geometry))
+        corridor = trace.buffer(half_width)
+
+        ny, nx = self.ew.shape
+        x_all, y_all = self.ew.x.values, self.ew.y.values   # pixel centres
+        dx, dy = np.abs(self.ew.rio.resolution())
+        pad = int(4 * smooth_sigma) + 2   # extra pixels so smoothing/gradients are clean at tile edges
+
+        strain = {key: [] for key in ("x", "y", "exx", "eyy", "exy")}
+        for row0 in range(0, ny, tile_size):
+            for col0 in range(0, nx, tile_size):
+
+                # Skip this tile unless the corridor crosses it
+                x_tile = x_all[col0:col0 + tile_size]
+                y_tile = y_all[row0:row0 + tile_size]
+                tile = box(x_tile.min() - dx / 2, y_tile.min() - dy / 2,
+                           x_tile.max() + dx / 2, y_tile.max() + dy / 2)
+                corridor_in_tile = corridor.intersection(tile)
+                if corridor_in_tile.is_empty:
+                    continue
+
+                # Read the tile plus padding; smooth
+                rows = slice(max(row0 - pad, 0), row0 + tile_size + pad)
+                cols = slice(max(col0 - pad, 0), col0 + tile_size + pad)
+                ew = self.ew.isel(y=rows, x=cols)
+                ns = self.ns.isel(y=rows, x=cols)
+                x, y = ew.x.values, ew.y.values
+                u = ew.values.astype(float)
+                v = ns.values.astype(float)
+                u[u == 0.] = np.nan
+                v[v == 0.] = np.nan
+                u = self._smooth_ignoring_nan(u, smooth_sigma)
+                v = self._smooth_ignoring_nan(v, smooth_sigma)
+
+                # Displacement gradients (coordinates are passed, so y decreasing
+                # down the array is handled)
+                du_dy, du_dx = np.gradient(u, y, x)
+                dv_dy, dv_dx = np.gradient(v, y, x)
+
+                # Green-Cauchy finite strain
+                exx = du_dx + 0.5 * (du_dx**2 + dv_dx**2)
+                eyy = dv_dy + 0.5 * (du_dy**2 + dv_dy**2)
+                exy = 0.5 * (du_dy + dv_dx + du_dx * du_dy + dv_dx * dv_dy)
+
+                # Keep pixels inside the corridor (and this tile) with valid strain
+                keep = geometry_mask([corridor_in_tile], out_shape=u.shape,
+                                     transform=ew.rio.transform(recalc=True), invert=True)
+                keep &= np.isfinite(exx) & np.isfinite(eyy) & np.isfinite(exy)
+                XX, YY = np.meshgrid(x, y)
+                strain["x"].append(XX[keep])
+                strain["y"].append(YY[keep])
+                strain["exx"].append(exx[keep].astype(np.float32))
+                strain["eyy"].append(eyy[keep].astype(np.float32))
+                strain["exy"].append(exy[keep].astype(np.float32))
+
+        strain = {key: np.concatenate(vals) for key, vals in strain.items()}
+        self._print(f"Finite strain on {len(strain['x'])} pixels within {half_width} m of the trace")
+        return strain
 
 
     ## Method to evaluate displacement along a given profile

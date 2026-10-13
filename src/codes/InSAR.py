@@ -90,6 +90,8 @@ class InSAR:
             self.los = self.los[u]
         if self.Cd is not None:
             self.Cd = self.Cd[np.ix_(u, u)]
+        if getattr(self, '_blocks', None) is not None:
+            self._blocks = [self._blocks[i] for i in u]
 
 
     ##  Read a GMT .grd (NetCDF) file
@@ -182,6 +184,110 @@ class InSAR:
         if bbox is not None:
             self.select_pixels(*bbox)
 
+        return self
+
+
+    ##  Export to GeoTIFF
+    def export_geotiff(self, filepath, fields='vel'):
+
+        '''
+        Write pixel data to a (multi-band) float32 GeoTIFF, NaN as nodata.
+
+        Full-resolution data are written on their native lon/lat grid (EPSG:4326),
+        with the pixel spacing inferred from the data; pixels removed by
+        select_pixels / check_nans are left as nodata.  Downsampled data (output of
+        downsample()) are written in the UTM CRS, with each quadtree block's
+        footprint filled with its averaged value at the smallest block size.
+
+        Args:
+            filepath (str): Output .tif path.
+
+        Kwargs:
+            fields (str or list of str): One band per field, from 'vel', 'err',
+                'los_e', 'los_n', 'los_u', or 'los' (expands to all three).
+
+        Returns:
+            self
+        '''
+
+        import rasterio
+        from rasterio.transform import from_origin
+
+        if isinstance(fields, str):
+            fields = [fields]
+        fields = [f for name in fields
+                  for f in (['los_e', 'los_n', 'los_u'] if name == 'los' else [name])]
+        los_col = {'los_e': 0, 'los_n': 1, 'los_u': 2}
+        values = []
+        for name in fields:
+            if name in los_col:
+                values.append(self.los[:, los_col[name]])
+            elif name in ('vel', 'err'):
+                values.append(getattr(self, name))
+            else:
+                raise ValueError(f"Unknown field '{name}'")
+
+        blocks = getattr(self, '_blocks', None)
+
+        if blocks is not None:
+            # Downsampled: burn block footprints onto a UTM grid at the finest block size
+            b = np.array(blocks)                         # (N, 4, 2), see downsample()
+            x_left, y_top = b[:, 0, 0], b[:, 0, 1]
+            x_right, y_bot = b[:, 2, 0], b[:, 2, 1]
+            res = float(np.min(x_right - x_left))
+            x0, y0 = float(x_left.min()), float(y_top.max())
+            ncol = int(round((x_right.max() - x0) / res))
+            nrow = int(round((y0 - y_bot.min()) / res))
+
+            idx = np.full((nrow, ncol), -1, dtype=np.int64)
+            c0 = np.round((x_left  - x0) / res).astype(int)
+            c1 = np.round((x_right - x0) / res).astype(int)
+            r0 = np.round((y0 - y_top) / res).astype(int)
+            r1 = np.round((y0 - y_bot) / res).astype(int)
+            for i in range(len(blocks)):
+                idx[r0[i]:r1[i], c0[i]:c1[i]] = i
+
+            transform = from_origin(x0, y0, res, res)
+            crs = rasterio.crs.CRS.from_wkt(self._proj.crs.to_wkt())
+            rows, cols = np.nonzero(idx >= 0)
+            src = idx[rows, cols]
+
+        else:
+            # Full resolution: rebuild the regular lon/lat grid from the pixel coordinates
+            lon = np.where(self.lon > 180., self.lon - 360., self.lon)
+            lat = self.lat
+
+            def _spacing(v):
+                d = np.diff(np.unique(v))
+                d = d[d > 1e-9 * max(np.ptp(v), 1e-12)]
+                if d.size == 0:
+                    raise ValueError('Cannot infer pixel spacing from fewer than two '
+                                     'distinct coordinates')
+                return float(d.min())
+
+            dlon, dlat = _spacing(lon), _spacing(lat)
+            lon0, lat0 = float(lon.min()), float(lat.max())
+            fc = (lon - lon0) / dlon
+            fr = (lat0 - lat) / dlat
+            cols, rows = np.round(fc).astype(int), np.round(fr).astype(int)
+            if max(np.abs(fc - cols).max(), np.abs(fr - rows).max()) > 0.01:
+                raise ValueError('Pixels do not lie on a regular lon/lat grid')
+            ncol, nrow = int(cols.max()) + 1, int(rows.max()) + 1
+
+            transform = from_origin(lon0 - dlon / 2., lat0 + dlat / 2., dlon, dlat)
+            crs = rasterio.crs.CRS.from_epsg(4326)
+            src = np.arange(len(self.vel))
+
+        with rasterio.open(filepath, 'w', driver='GTiff', height=nrow, width=ncol,
+                           count=len(fields), dtype='float32', crs=crs,
+                           transform=transform, nodata=np.nan, compress='deflate') as dst:
+            for band, (name, v) in enumerate(zip(fields, values), start=1):
+                grid = np.full((nrow, ncol), np.nan, dtype=np.float32)
+                grid[rows, cols] = np.asarray(v)[src]
+                dst.write(grid, band)
+                dst.set_band_description(band, name)
+
+        self._print(f"  Wrote {nrow} x {ncol} x {len(fields)} GeoTIFF: {filepath}")
         return self
 
 
@@ -423,7 +529,7 @@ class InSAR:
         block are averaged to yield one downsampled observation.
 
         Args:
-            faults: A Fault3d object or list thereof.  Each must expose a .get_surface_trace_xy()
+            faults: A Fault3d object or list thereof.  Each must expose a .trace
                     GeoDataFrame with line geometry in the same CRS as the InSAR data.
 
         Kwargs:
@@ -443,7 +549,7 @@ class InSAR:
             faults = [faults]
 
         # Merge all fault trace geometries into a single shapely geometry
-        fault_geom = unary_union([f.get_surface_trace_xy().geometry.unary_union for f in faults])
+        fault_geom = unary_union([f.trace.geometry.unary_union for f in faults])
 
         # Estimate pixel spacing from a small probe subset
         n_probe      = min(1000, len(self.x))
@@ -599,7 +705,7 @@ class InSAR:
         plt.colorbar(sc, ax=ax, label='LOS displacement (m)', shrink=0.8)
 
         if fault is not None and hasattr(fault, 'trace'):
-            for geom in fault.get_surface_trace_xy().geometry:
+            for geom in fault.trace.geometry:
                 lines = [geom] if isinstance(geom, LineString) else list(geom.geoms)
                 for line in lines:
                     coords = np.array(line.coords)
